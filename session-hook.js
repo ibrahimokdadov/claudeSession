@@ -60,9 +60,48 @@ process.stdin.on('end', () => {
     return;
   }
 
+  // Detect terminal ancestor once per session (when file doesn't yet have terminalPid)
+  let terminalPid = null;
+  let terminalType = null;
+  try {
+    const existing = JSON.parse(fs.readFileSync(filepath, 'utf8'));
+    terminalPid  = existing.terminalPid  || null;
+    terminalType = existing.terminalType || null;
+  } catch (_) {}
+
+  if (!terminalPid) {
+    try {
+      const { execSync } = require('child_process');
+      const KNOWN = ['WindowsTerminal', 'ConEmu64', 'ConEmu', 'Code', 'mintty', 'Hyper'];
+      const knownList = KNOWN.map(n => `'${n}'`).join(',');
+      const script = [
+        `$known = @(${knownList});`,
+        `$p = ${process.ppid};`,
+        `for ($i = 0; $i -lt 10; $i++) {`,
+        `  $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$p" -EA SilentlyContinue;`,
+        `  if (-not $proc) { break }`,
+        `  $name = $proc.Name -replace '\\.exe$','';`,
+        `  if ($name -in $known) {`,
+        `    [PSCustomObject]@{ pid = [int]$proc.ProcessId; type = $name } | ConvertTo-Json -Compress;`,
+        `    break`,
+        `  }`,
+        `  if ($proc.ParentProcessId -le 0) { break }`,
+        `  $p = $proc.ParentProcessId`,
+        `}`,
+      ].join(' ');
+      const raw = execSync(`powershell.exe -NonInteractive -Command "${script}"`,
+        { timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
+      if (raw) {
+        const info = JSON.parse(raw);
+        terminalPid  = info.pid  || null;
+        terminalType = info.type || null;
+      }
+    } catch (_) {}
+  }
+
   // Atomic write: write to .tmp then rename to avoid partial reads on fast refresh
   const tmpPath = filepath + '.tmp';
-  fs.writeFileSync(tmpPath, JSON.stringify({ project, status, message, cwd, sessionId, pid: process.ppid, timestamp: Date.now() }));
+  fs.writeFileSync(tmpPath, JSON.stringify({ project, status, message, cwd, sessionId, pid: process.ppid, terminalPid, terminalType, timestamp: Date.now() }));
   fs.renameSync(tmpPath, filepath);
 
   // Persist session ID → project mapping for crash recovery

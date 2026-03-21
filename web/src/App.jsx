@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import Board from './Board.jsx'
 import Drawer from './Drawer.jsx'
+import Settings from './Settings.jsx'
 import './App.css'
 
 const WS_URL = `ws://${location.host}/ws`
@@ -8,6 +9,7 @@ const WS_URL = `ws://${location.host}/ws`
 export default function App() {
   const [sessions, setSessions] = useState(new Map())
   const [drawerProject, setDrawerProject] = useState(null)
+  const [settingsOpen, setSettingsOpen] = useState(false)
   const [connected, setConnected] = useState(false)
   const wsRef = useRef(null)
   const retryDelay = useRef(1000)
@@ -78,6 +80,7 @@ export default function App() {
         activeProject={drawerProject}
         connected={connected}
         onSelect={p => setDrawerProject(p === drawerProject ? null : p)}
+        onSettings={() => setSettingsOpen(true)}
       />
       {drawerSession && (
         <Drawer
@@ -89,6 +92,7 @@ export default function App() {
           onFocus={() => handleFocus(drawerSession.project)}
         />
       )}
+      {settingsOpen && <Settings onClose={() => setSettingsOpen(false)} />}
     </div>
   )
 }

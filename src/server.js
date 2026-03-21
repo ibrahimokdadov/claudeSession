@@ -163,24 +163,98 @@ app.post('/api/sessions/:fileKey/focus', (req, res) => {
   const { fileKey } = req.params
   let focused = false
   try {
-    const { pid } = JSON.parse(fs.readFileSync(path.join(sessionsDir, fileKey + '.json'), 'utf8'))
-    if (pid) {
-      const script = [
+    const session = JSON.parse(fs.readFileSync(path.join(sessionsDir, fileKey + '.json'), 'utf8'))
+    const { pid, terminalPid, terminalType } = session
+
+    // Determine which terminal PID to focus
+    let targetPid = terminalPid || null
+
+    // If no pre-recorded terminal, walk the tree now using the preferred terminal setting
+    if (!targetPid && pid) {
+      const settings = (readMeta(metaFile)._settings) || {}
+      const preferred = settings.preferredTerminal || null
+      const KNOWN = preferred
+        ? [preferred]
+        : ['WindowsTerminal', 'ConEmu64', 'ConEmu', 'Code', 'mintty', 'Hyper']
+      const knownList = KNOWN.map(n => `'${n}'`).join(',')
+      const walkScript = [
+        `$known = @(${knownList});`,
         `$p = ${pid};`,
-        `$wt = Get-Process WindowsTerminal -ErrorAction SilentlyContinue | Where-Object {`,
-        `  (Get-CimInstance Win32_Process -Filter "ParentProcessId=$($_.Id)").ProcessId -contains $p`,
-        `} | Select-Object -First 1;`,
-        `if ($wt) {`,
-        `  Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class W { [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h); }';`,
-        `  [W]::SetForegroundWindow($wt.MainWindowHandle);`,
-        `  Write-Output "focused"`,
-        `}`
+        `for ($i = 0; $i -lt 10; $i++) {`,
+        `  $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$p" -EA SilentlyContinue;`,
+        `  if (-not $proc) { break }`,
+        `  $name = $proc.Name -replace '\\.exe$','';`,
+        `  if ($name -in $known) { Write-Output $proc.ProcessId; break }`,
+        `  if ($proc.ParentProcessId -le 0) { break }`,
+        `  $p = $proc.ParentProcessId`,
+        `}`,
       ].join(' ')
-      const out = execSync(`powershell.exe -NonInteractive -Command "${script}"`, { timeout: 6000 }).toString().trim()
+      const raw = execSync(`powershell.exe -NonInteractive -Command "${walkScript}"`,
+        { timeout: 4000, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim()
+      if (raw) targetPid = parseInt(raw, 10) || null
+    }
+
+    if (targetPid) {
+      const focusScript = [
+        `$proc = Get-Process -Id ${targetPid} -EA SilentlyContinue;`,
+        `if ($proc -and $proc.MainWindowHandle -ne 0) {`,
+        `  Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class W { [DllImport(""user32.dll"")] public static extern bool SetForegroundWindow(IntPtr h); }' -EA SilentlyContinue;`,
+        `  [W]::SetForegroundWindow($proc.MainWindowHandle);`,
+        `  Write-Output "focused"`,
+        `}`,
+      ].join(' ')
+      const out = execSync(`powershell.exe -NonInteractive -Command "${focusScript}"`,
+        { timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim()
       focused = out === 'focused'
     }
   } catch (_) {}
   res.json({ focused })
+})
+
+// ── Terminals + Settings ───────────────────────────────────────────────────────
+
+const KNOWN_TERMINALS = [
+  { name: 'WindowsTerminal', label: 'Windows Terminal' },
+  { name: 'ConEmu64',        label: 'ConEmu / Cmder (64-bit)' },
+  { name: 'ConEmu',          label: 'ConEmu / Cmder (32-bit)' },
+  { name: 'Code',            label: 'VS Code (integrated terminal)' },
+  { name: 'mintty',          label: 'Git Bash / Mintty' },
+  { name: 'Hyper',           label: 'Hyper' },
+]
+
+app.get('/api/terminals', (req, res) => {
+  let running = []
+  try {
+    const nameList = KNOWN_TERMINALS.map(t => `'${t.name}'`).join(',')
+    const script = `Get-Process | Where-Object { ($_.Name -replace '\\.exe$','') -in @(${nameList}) } | Select-Object -ExpandProperty Name -Unique | ForEach-Object { $_ -replace '\\.exe$','' } | ConvertTo-Json -Compress`
+    const raw = execSync(`powershell.exe -NonInteractive -Command "${script}"`,
+      { timeout: 4000, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim()
+    if (raw) {
+      const names = JSON.parse(raw)
+      running = Array.isArray(names) ? names : [names]
+    }
+  } catch (_) {}
+
+  const settings = (readMeta(metaFile)._settings) || {}
+  res.json({
+    terminals: KNOWN_TERMINALS.map(t => ({
+      ...t,
+      running: running.includes(t.name),
+    })),
+    preferred: settings.preferredTerminal || null,
+  })
+})
+
+app.get('/api/settings', (req, res) => {
+  const m = readMeta(metaFile)
+  res.json(m._settings || {})
+})
+
+app.post('/api/settings', (req, res) => {
+  meta = readMeta(metaFile)
+  meta._settings = { ...(meta._settings || {}), ...req.body }
+  writeMeta(metaFile, meta)
+  res.json({ ok: true })
 })
 
 // ── Static (production) ───────────────────────────────────────────────────────

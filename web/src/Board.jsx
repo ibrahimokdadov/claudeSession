@@ -31,7 +31,7 @@ function ConnDot({ connected }) {
   )
 }
 
-export default function Board({ sessions, activeProject, connected, onSelect }) {
+export default function Board({ sessions, activeProject, connected, onSelect, onSettings }) {
   const total = sessions.length
 
   return (
@@ -72,7 +72,25 @@ export default function Board({ sessions, activeProject, connected, onSelect }) 
             {total} session{total !== 1 ? 's' : ''}
           </span>
         </div>
-        <ConnDot connected={connected} />
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <ConnDot connected={connected} />
+          <button
+            onClick={onSettings}
+            title="Settings"
+            style={{
+              color: 'var(--text-dim)',
+              fontSize: 14,
+              lineHeight: 1,
+              padding: '2px 3px',
+              borderRadius: 3,
+              transition: 'color 0.1s',
+            }}
+            onMouseEnter={e => e.currentTarget.style.color = 'var(--text-secondary)'}
+            onMouseLeave={e => e.currentTarget.style.color = 'var(--text-dim)'}
+          >
+            ⚙
+          </button>
+        </div>
       </div>
 
       {/* Columns grid */}
