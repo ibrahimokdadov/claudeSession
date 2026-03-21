@@ -159,54 +159,128 @@ app.delete('/api/sessions/:fileKey', (req, res) => {
   res.json({ ok: true })
 })
 
+// Known terminal process names (no .exe suffix)
+const TERMINAL_NAMES = ['WindowsTerminal', 'ConEmu64', 'ConEmu', 'Code', 'mintty', 'Hyper', 'Warp']
+
+function findClaudePid(sessionId, fallbackPid) {
+  // 1. Check numeric PID files in sessions dir (written by claudeMonitor or similar)
+  try {
+    for (const f of fs.readdirSync(sessionsDir)) {
+      if (!/^\d+\.json$/.test(f)) continue
+      try {
+        const d = JSON.parse(fs.readFileSync(path.join(sessionsDir, f), 'utf8'))
+        if (d.sessionId === sessionId) return d.pid
+      } catch (_) {}
+    }
+  } catch (_) {}
+
+  // 2. WMI scan for Claude process with --resume <sessionId>
+  if (sessionId) {
+    try {
+      const script = `Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*claude-code*cli.js*--resume*${sessionId}*' } | Select-Object -First 1 -ExpandProperty ProcessId`
+      const raw = execSync(`powershell.exe -NonInteractive -Command "${script}"`,
+        { timeout: 4000, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim()
+      if (raw && /^\d+$/.test(raw)) return parseInt(raw, 10)
+    } catch (_) {}
+  }
+
+  // 3. Verify stored pid is still alive
+  if (fallbackPid) {
+    try {
+      const script = `if (Get-Process -Id ${fallbackPid} -EA SilentlyContinue) { Write-Output 'alive' }`
+      const out = execSync(`powershell.exe -NonInteractive -Command "${script}"`,
+        { timeout: 2000, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim()
+      if (out === 'alive') return fallbackPid
+    } catch (_) {}
+  }
+
+  return null
+}
+
+function walkToTerminal(claudePid, preferredTerminal) {
+  const preferred = preferredTerminal || null
+  const names = preferred
+    ? [preferred, ...TERMINAL_NAMES.filter(n => n !== preferred)]
+    : TERMINAL_NAMES
+  const knownList = names.map(n => `'${n}'`).join(',')
+  try {
+    const script = [
+      `$known = @(${knownList});`,
+      `$p = ${claudePid};`,
+      `for ($i = 0; $i -lt 12; $i++) {`,
+      `  $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$p" -EA SilentlyContinue;`,
+      `  if (-not $proc) { break }`,
+      `  $name = $proc.Name -replace '\\.exe$','';`,
+      `  if ($name -in $known) { Write-Output $proc.ProcessId; break }`,
+      `  if ($proc.ParentProcessId -le 0) { break }`,
+      `  $p = $proc.ParentProcessId`,
+      `}`,
+    ].join(' ')
+    const raw = execSync(`powershell.exe -NonInteractive -Command "${script}"`,
+      { timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim()
+    return (raw && /^\d+$/.test(raw)) ? parseInt(raw, 10) : null
+  } catch (_) { return null }
+}
+
+function focusWindow(termPid) {
+  // Write PS script to temp file to avoid quoting hell with Add-Type
+  const tmpScript = path.join(os.tmpdir(), `cs-focus-${process.pid}.ps1`)
+  const ps = `
+$proc = Get-Process -Id ${termPid} -ErrorAction SilentlyContinue
+if (-not $proc -or $proc.MainWindowHandle -eq 0) { exit }
+$hwnd = $proc.MainWindowHandle
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class WinFocus {
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint p);
+  [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool attach);
+  [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+}
+'@ -ErrorAction SilentlyContinue
+[WinFocus]::ShowWindow($hwnd, 9)
+$fg = [WinFocus]::GetForegroundWindow()
+$fgTid = 0; [WinFocus]::GetWindowThreadProcessId($fg, [ref]$fgTid) | Out-Null
+$myTid = [WinFocus]::GetCurrentThreadId()
+[WinFocus]::AttachThreadInput($myTid, $fgTid, $true) | Out-Null
+[WinFocus]::SetForegroundWindow($hwnd) | Out-Null
+[WinFocus]::AttachThreadInput($myTid, $fgTid, $false) | Out-Null
+Write-Output "focused"
+`
+  try {
+    fs.writeFileSync(tmpScript, ps)
+    const out = execSync(
+      `powershell.exe -NonInteractive -ExecutionPolicy Bypass -File "${tmpScript}"`,
+      { timeout: 8000, stdio: ['ignore', 'pipe', 'ignore'] }
+    ).toString().trim()
+    return out === 'focused'
+  } catch (_) {
+    return false
+  } finally {
+    try { fs.unlinkSync(tmpScript) } catch (_) {}
+  }
+}
+
 app.post('/api/sessions/:fileKey/focus', (req, res) => {
   const { fileKey } = req.params
   let focused = false
   try {
     const session = JSON.parse(fs.readFileSync(path.join(sessionsDir, fileKey + '.json'), 'utf8'))
-    const { pid, terminalPid, terminalType } = session
+    const { pid, terminalPid, sessionId } = session
+    const settings = (readMeta(metaFile)._settings) || {}
 
-    // Determine which terminal PID to focus
+    // Use pre-recorded terminal PID if available
     let targetPid = terminalPid || null
 
-    // If no pre-recorded terminal, walk the tree now using the preferred terminal setting
-    if (!targetPid && pid) {
-      const settings = (readMeta(metaFile)._settings) || {}
-      const preferred = settings.preferredTerminal || null
-      const KNOWN = preferred
-        ? [preferred]
-        : ['WindowsTerminal', 'ConEmu64', 'ConEmu', 'Code', 'mintty', 'Hyper']
-      const knownList = KNOWN.map(n => `'${n}'`).join(',')
-      const walkScript = [
-        `$known = @(${knownList});`,
-        `$p = ${pid};`,
-        `for ($i = 0; $i -lt 10; $i++) {`,
-        `  $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$p" -EA SilentlyContinue;`,
-        `  if (-not $proc) { break }`,
-        `  $name = $proc.Name -replace '\\.exe$','';`,
-        `  if ($name -in $known) { Write-Output $proc.ProcessId; break }`,
-        `  if ($proc.ParentProcessId -le 0) { break }`,
-        `  $p = $proc.ParentProcessId`,
-        `}`,
-      ].join(' ')
-      const raw = execSync(`powershell.exe -NonInteractive -Command "${walkScript}"`,
-        { timeout: 4000, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim()
-      if (raw) targetPid = parseInt(raw, 10) || null
+    if (!targetPid) {
+      const claudePid = findClaudePid(sessionId, pid)
+      if (claudePid) targetPid = walkToTerminal(claudePid, settings.preferredTerminal)
     }
 
-    if (targetPid) {
-      const focusScript = [
-        `$proc = Get-Process -Id ${targetPid} -EA SilentlyContinue;`,
-        `if ($proc -and $proc.MainWindowHandle -ne 0) {`,
-        `  Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class W { [DllImport(""user32.dll"")] public static extern bool SetForegroundWindow(IntPtr h); }' -EA SilentlyContinue;`,
-        `  [W]::SetForegroundWindow($proc.MainWindowHandle);`,
-        `  Write-Output "focused"`,
-        `}`,
-      ].join(' ')
-      const out = execSync(`powershell.exe -NonInteractive -Command "${focusScript}"`,
-        { timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim()
-      focused = out === 'focused'
-    }
+    if (targetPid) focused = focusWindow(targetPid)
   } catch (_) {}
   res.json({ focused })
 })
@@ -215,6 +289,7 @@ app.post('/api/sessions/:fileKey/focus', (req, res) => {
 
 const KNOWN_TERMINALS = [
   { name: 'WindowsTerminal', label: 'Windows Terminal' },
+  { name: 'Warp',            label: 'Warp' },
   { name: 'ConEmu64',        label: 'ConEmu / Cmder (64-bit)' },
   { name: 'ConEmu',          label: 'ConEmu / Cmder (32-bit)' },
   { name: 'Code',            label: 'VS Code (integrated terminal)' },
