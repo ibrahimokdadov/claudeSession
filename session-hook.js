@@ -54,6 +54,17 @@ process.stdin.on('end', () => {
   const filename = sessionId ? `${project}-${sessionId.substring(0, 8)}.json` : `${project}.json`;
   const filepath = path.join(sessionsDir, filename);
 
+  // SubagentStart: record spawn intent so the child session can claim its parent
+  if (status === 'subagent') {
+    if (sessionId) {
+      const intentFile = path.join(sessionsDir, `.spawn-intent-${sessionId.substring(0, 8)}.json`);
+      const tmpIntent = intentFile + '.tmp';
+      fs.writeFileSync(tmpIntent, JSON.stringify({ parentSessionId: sessionId, cwd, timestamp: Date.now() }));
+      fs.renameSync(tmpIntent, intentFile);
+    }
+    return;
+  }
+
   // "ended" = session is gone, clean up immediately instead of waiting for stale timeout
   if (status === 'ended') {
     try { fs.unlinkSync(filepath); } catch (_) {}
@@ -72,13 +83,13 @@ process.stdin.on('end', () => {
   if (!terminalPid) {
     try {
       const { execSync } = require('child_process');
-      const KNOWN = ['WindowsTerminal', 'ConEmu64', 'ConEmu', 'Code', 'mintty', 'Hyper'];
+      const KNOWN = ['WindowsTerminal', 'ConEmu64', 'ConEmu', 'Code', 'mintty', 'Hyper', 'Warp', 'warp'];
       const knownList = KNOWN.map(n => `'${n}'`).join(',');
       const script = [
         `$known = @(${knownList});`,
         `$p = ${process.ppid};`,
         `for ($i = 0; $i -lt 10; $i++) {`,
-        `  $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$p" -EA SilentlyContinue;`,
+        `  $proc = Get-CimInstance Win32_Process | Where-Object ProcessId -eq $p | Select-Object -First 1;`,
         `  if (-not $proc) { break }`,
         `  $name = $proc.Name -replace '\\.exe$','';`,
         `  if ($name -in $known) {`,
@@ -99,9 +110,35 @@ process.stdin.on('end', () => {
     } catch (_) {}
   }
 
+  // Determine parentSessionId: read from existing file or claim a recent spawn intent
+  let parentSessionId = null;
+  try {
+    const existing = JSON.parse(fs.readFileSync(filepath, 'utf8'));
+    parentSessionId = existing.parentSessionId || null;
+  } catch (_) {}
+
+  if (!parentSessionId) {
+    try {
+      const now = Date.now();
+      const intentFiles = fs.readdirSync(sessionsDir)
+        .filter(f => f.startsWith('.spawn-intent-') && f.endsWith('.json'))
+        .map(f => {
+          try { return { name: f, intent: JSON.parse(fs.readFileSync(path.join(sessionsDir, f), 'utf8')) }; }
+          catch (_) { return null; }
+        })
+        .filter(x => x && x.intent.cwd === cwd && now - x.intent.timestamp < 10000)
+        .sort((a, b) => b.intent.timestamp - a.intent.timestamp); // most recent first
+      if (intentFiles.length > 0) {
+        const { name, intent } = intentFiles[0];
+        parentSessionId = intent.parentSessionId;
+        try { fs.unlinkSync(path.join(sessionsDir, name)); } catch (_) {} // claim it
+      }
+    } catch (_) {}
+  }
+
   // Atomic write: write to .tmp then rename to avoid partial reads on fast refresh
   const tmpPath = filepath + '.tmp';
-  fs.writeFileSync(tmpPath, JSON.stringify({ project, status, message, cwd, sessionId, pid: process.ppid, terminalPid, terminalType, timestamp: Date.now() }));
+  fs.writeFileSync(tmpPath, JSON.stringify({ project, status, message, cwd, sessionId, pid: process.ppid, terminalPid, terminalType, parentSessionId, timestamp: Date.now() }));
   fs.renameSync(tmpPath, filepath);
 
   // Persist session ID → project mapping for crash recovery
