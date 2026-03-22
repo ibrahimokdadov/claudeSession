@@ -42,6 +42,11 @@ export function projectStatus(sessions) {
   }, pool[0]?.status ?? 'running')
 }
 
+/** Normalize a cwd path for use as a Map key: forward slashes, lowercase drive letter. */
+function normalizeCwd(cwd) {
+  return cwd.replace(/\\/g, '/').replace(/^([A-Z]):/, m => m.toLowerCase())
+}
+
 /** Groups a sessions Map (fileKey → session) into a projects Map (cwd → project).
  *  Each project: { cwd, project, label, color, status, lastTimestamp, sessions[] } */
 export function groupIntoProjects(sessionsMap) {
@@ -51,9 +56,11 @@ export function groupIntoProjects(sessionsMap) {
     const { cwd } = session
     if (!cwd) continue
 
-    if (!projects.has(cwd)) {
-      projects.set(cwd, {
-        cwd,
+    const key = normalizeCwd(cwd)
+
+    if (!projects.has(key)) {
+      projects.set(key, {
+        cwd: key,  // use normalized path as canonical cwd (consistent key for selectedCwd)
         project:       session.project || cwd,
         label:         session.label   || session.project || cwd,
         color:         session.color   || 'var(--accent-working)',
@@ -63,7 +70,7 @@ export function groupIntoProjects(sessionsMap) {
       })
     }
 
-    const proj = projects.get(cwd)
+    const proj = projects.get(key)
     proj.sessions.push(session)
     if ((session.timestamp || 0) > proj.lastTimestamp) {
       proj.lastTimestamp = session.timestamp
