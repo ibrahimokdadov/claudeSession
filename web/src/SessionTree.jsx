@@ -98,6 +98,16 @@ function SessionNode({ session, depth, isLast, onFocus, onKill }) {
           </span>
         </div>
 
+        {/* Worktree badge — shown when session lives in a sub-path (worktree) */}
+        {session.worktree && (
+          <div style={{
+            fontSize: 9, color: 'var(--text-dim)', marginTop: 1,
+            paddingLeft: 12, fontFamily: 'var(--font-mono)',
+          }}>
+            ↳ {session.worktree}
+          </div>
+        )}
+
         {/* Message row */}
         {session.message && (
           <div style={{

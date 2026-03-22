@@ -22,7 +22,7 @@ function ConnDot({ connected }) {
   )
 }
 
-function ProjectRow({ project, displayLabel, isSelected, onSelect }) {
+function ProjectRow({ project, isSelected, onSelect }) {
   const timeAgo = useRelativeTime(project.lastTimestamp)
   const allStale = project.sessions.every(s => isStale(s))
   const pulse = PULSE_STATUSES.has(project.status)
@@ -53,7 +53,7 @@ function ProjectRow({ project, displayLabel, isSelected, onSelect }) {
           color: isSelected ? project.color : 'var(--text-primary)',
           whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
         }}>
-          {displayLabel}
+          {project.label}
         </div>
         <div style={{ fontSize: 9, color: 'var(--text-dim)', display: 'flex', gap: 6, marginTop: 1 }}>
           <span>{project.status === 'running' ? 'idle' : project.status}</span>
@@ -70,27 +70,8 @@ function ProjectRow({ project, displayLabel, isSelected, onSelect }) {
   )
 }
 
-/** For projects whose label collides with another, compute a short disambiguating suffix. */
-function buildLabelMap(projectList) {
-  const counts = {}
-  projectList.forEach(p => { counts[p.label] = (counts[p.label] || 0) + 1 })
-  const result = {}
-  projectList.forEach(p => {
-    if (counts[p.label] > 1) {
-      // Use parent dir as suffix: e.g. "frontend" → "frontend (aiBoss)"
-      const parts = p.cwd.replace(/\\/g, '/').split('/')
-      const parent = parts[parts.length - 2] || ''
-      result[p.cwd] = parent ? `${p.label} (${parent})` : p.cwd
-    } else {
-      result[p.cwd] = p.label
-    }
-  })
-  return result
-}
-
 export default function Sidebar({ projects, selectedCwd, connected, onSelect, onSettings }) {
   const projectList = Array.from(projects.values())
-  const labelMap = buildLabelMap(projectList)
 
   // Sort: active projects first (by lastTimestamp desc), then stale (by lastTimestamp desc)
   const active = projectList
@@ -156,7 +137,6 @@ export default function Sidebar({ projects, selectedCwd, connected, onSelect, on
           <ProjectRow
             key={p.cwd}
             project={p}
-            displayLabel={labelMap[p.cwd]}
             isSelected={p.cwd === selectedCwd}
             onSelect={() => onSelect(p.cwd)}
           />

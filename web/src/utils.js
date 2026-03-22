@@ -42,9 +42,17 @@ export function projectStatus(sessions) {
   }, pool[0]?.status ?? 'running')
 }
 
-/** Normalize a cwd path for use as a Map key: forward slashes, lowercase drive letter. */
+/** Normalize a cwd path: forward slashes, lowercase drive letter. */
 function normalizeCwd(cwd) {
   return cwd.replace(/\\/g, '/').replace(/^([A-Z]):/, m => m.toLowerCase())
+}
+
+/** Get the project root: strip /.worktrees/... (and any sub-paths after it) so all
+ *  worktrees for the same repo collapse into a single project row. */
+function getProjectRoot(cwd) {
+  const norm = normalizeCwd(cwd)
+  const idx = norm.indexOf('/.worktrees/')
+  return idx !== -1 ? norm.slice(0, idx) : norm
 }
 
 /** Groups a sessions Map (fileKey → session) into a projects Map (cwd → project).
@@ -56,13 +64,14 @@ export function groupIntoProjects(sessionsMap) {
     const { cwd } = session
     if (!cwd) continue
 
-    const key = normalizeCwd(cwd)
+    const key = getProjectRoot(cwd)
 
     if (!projects.has(key)) {
+      const rootName = key.split('/').at(-1) || key
       projects.set(key, {
-        cwd: key,  // use normalized path as canonical cwd (consistent key for selectedCwd)
-        project:       session.project || cwd,
-        label:         session.label   || session.project || cwd,
+        cwd: key,  // normalized project root path — consistent key for selectedCwd
+        project:       rootName,
+        label:         session.label || rootName,
         color:         session.color   || 'var(--accent-working)',
         status:        'running',
         lastTimestamp: 0,
@@ -71,7 +80,12 @@ export function groupIntoProjects(sessionsMap) {
     }
 
     const proj = projects.get(key)
-    proj.sessions.push(session)
+    // Tag session with worktree name if it lives in a sub-path of the root
+    const normSession = normalizeCwd(cwd)
+    const worktree = normSession !== key
+      ? normSession.slice(key.length).replace(/^\/\.worktrees\//, '').split('/')[0]
+      : null
+    proj.sessions.push({ ...session, worktree })
     if ((session.timestamp || 0) > proj.lastTimestamp) {
       proj.lastTimestamp = session.timestamp
       // Use most recent session for label/color meta
