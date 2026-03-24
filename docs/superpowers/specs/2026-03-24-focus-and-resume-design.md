@@ -230,7 +230,7 @@ A single `setTimeout` resets the label for both "Focused!" and "Opened!" states.
 | `focusTab.ps1` exits 2 (tab not found, session alive) | Re-check liveness; if still alive return `{ focused: false, opened: false }` HTTP 200; if now dead fall through to open-new-tab |
 | `focusTab.ps1` exits 2 (tab not found, session now dead) | Open new tab as if session was not running |
 | `wt.exe` spawn fails | Catch error, return `{ focused: false, opened: false }` HTTP 200 |
-| `cwd` missing from meta | Use project name as fallback for `--startingDirectory`; pass it via spawn args array (no escaping needed) |
+| `cwd` missing from meta | Pass project name as `--startingDirectory`; WT will not find it as a valid path and will fall back to `%USERPROFILE%`. The session opens but not in the project directory. This is a known degraded case — acceptable since `cwd` is absent only for synthetic/incomplete session entries. |
 | Session pid is 0 or undefined | `isAlive` returns false; treat as not running |
 | Label contains regex metacharacters (`[`, `]`, `*`, etc.) | `[Regex]::Escape` in PS1 handles all cases |
 
