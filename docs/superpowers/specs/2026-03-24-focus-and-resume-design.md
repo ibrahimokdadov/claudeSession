@@ -50,9 +50,11 @@ Each project entry gains an optional `lastSessionId` field:
 }
 ```
 
-**Written:** by `session-hook.js` on every `SessionStart` event, during the existing atomic meta write.
+**Written:** by `session-hook.js` on every `SessionStart` event, during the existing atomic meta write. This applies regardless of how the session was first discovered — whether via the hook or via the server's startup WMI scan. When a `SessionStart` hook fires for a process-discovered session (one that already has a synthetic session file), `lastSessionId` is written at that point.
+
 **Never cleared:** persists when a session ends so a future Focus can resume it.
-**Absent** for projects that have never had a `SessionStart` fire (process-discovered sessions).
+
+**Absent** for projects that have never had a `SessionStart` hook fire. These are handled by the NO-`lastSessionId` branch (open fresh `claude`).
 
 ---
 
@@ -75,27 +77,41 @@ This piggybacks on the existing atomic write (`tmp → rename`) — no separate 
 **Decision tree:**
 
 ```
-Session file exists AND process alive (kill -0 pid)?
-  ├── YES → PowerShell: UI Automation tab switch + SetForegroundWindow
-  │          → { focused: true }
-  └── NO  → lastSessionId known in session-meta.json?
-              ├── YES → wt.exe new-tab: claude --resume <lastSessionId> in <cwd>
-              │          → { focused: false, opened: true }
-              └── NO  → wt.exe new-tab: claude in <cwd>
-                         → { focused: false, opened: true }
-              (if wt.exe not found or spawn fails)
-                         → { focused: false, opened: false }
+Session file exists AND isAlive(pid)?
+  ├── YES → Run focusTab.ps1 with label
+  │          ├── exit 0 (tab found + switched)
+  │          │    → { focused: true, opened: false }           HTTP 200
+  │          ├── exit 1 (WT process not found)
+  │          │    → { focused: false, opened: false }          HTTP 200
+  │          │      (do NOT spawn — session is alive elsewhere)
+  │          └── exit 2 (tab not found)
+  │               → re-check isAlive(pid)
+  │                  ├── still alive → SetForegroundWindow(wt)
+  │                  │                 { focused: false, opened: false }   HTTP 200
+  │                  └── now dead    → fall through to open-new-tab branch
+  └── NO (session not running) →
+        lastSessionId known?
+          ├── YES → wt.exe new-tab: cmd /k "claude --resume <lastSessionId>"
+          └── NO  → wt.exe new-tab: cmd /k "claude"
+        spawn succeeded?
+          ├── YES → { focused: false, opened: true }           HTTP 200
+          └── NO  → { focused: false, opened: false }          HTTP 200
 ```
 
-**Process liveness check** (before attempting UI Automation):
+All responses return **HTTP 200**. Success/failure is communicated in the response body. This is consistent with the base spec's convention for the original focus endpoint.
+
+**Process liveness check:**
 ```js
 function isAlive(pid) {
+  if (!pid) return false;
   try { process.kill(pid, 0); return true; }
   catch { return false; }
 }
 ```
 
-**Tab switch PowerShell script** (`src/focusTab.ps1`):
+---
+
+### 4. `src/focusTab.ps1` — UI Automation tab switcher
 
 ```powershell
 param([string]$Label)
@@ -121,51 +137,76 @@ $cond = New-Object System.Windows.Automation.PropertyCondition(
 )
 $tabs = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)
 
+# Escape label for regex: square brackets and other regex metacharacters
+$escaped = [Regex]::Escape($Label)
+
 foreach ($tab in $tabs) {
-  if ($tab.Current.Name -like "*[$Label]*") {
+  # Tab title format: "[label] status" — match on the bracketed label prefix
+  if ($tab.Current.Name -match "^\[$escaped\]") {
     $invoke = $tab.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
     $invoke.Invoke()
-    [Win32]::ShowWindow($wt.MainWindowHandle, 9)   # SW_RESTORE
+    [Win32]::ShowWindow($wt.MainWindowHandle, 9)        # SW_RESTORE
     [Win32]::SetForegroundWindow($wt.MainWindowHandle)
     exit 0
   }
 }
-exit 2  # tab not found (session may have different title)
+
+# Tab not found — bring WT to front anyway so user can see it
+[Win32]::ShowWindow($wt.MainWindowHandle, 9)
+[Win32]::SetForegroundWindow($wt.MainWindowHandle)
+exit 2
 ```
+
+**Note on label matching:** `-like` operator treats `[`, `]`, `*`, `?` as special. This script uses `-match` with `[Regex]::Escape($Label)` instead, which correctly handles all label characters including `[`, `]`, `*`, `?`, `.`, `+`, etc. The pattern `^\[$escaped\]` matches the literal `[label]` prefix at the start of the tab title.
 
 Exit codes:
-- `0` — tab found and switched
+- `0` — tab found, switched, WT brought to front
 - `1` — WindowsTerminal process not found
-- `2` — tab not found (fall through: still bring WT to front, return `{ focused: false }`)
-
-**Open new tab PowerShell** (inline, from `server.js`):
-
-```powershell
-$cmd = 'claude --resume <lastSessionId>'   # or just 'claude' if no lastSessionId
-Start-Process wt.exe "-w 0 new-tab --title `"[<label>]`" --startingDirectory `"<cwd>`" cmd /k `"$cmd`""
-```
-
-`-w 0` ensures the new tab opens in the existing WT window (not a new window). If WT is not running, `Start-Process wt.exe` starts it.
-
-**Updated response contract:**
-
-| Scenario | Response |
-|---|---|
-| Tab found and switched | `{ focused: true, opened: false }` |
-| Session not running, new tab opened | `{ focused: false, opened: true }` |
-| WT not found, spawn also failed | `{ focused: false, opened: false }` |
+- `2` — tab not found, WT still brought to front
 
 ---
 
-### 4. `Drawer.jsx` — Focus button feedback
+### 5. Open new tab (server.js, inline)
 
-```jsx
-// existing: shows "Focused!" on { focused: true }
-// new: also shows "Opened!" on { opened: true }
-const label = result.focused ? 'Focused!' : result.opened ? 'Opened!' : 'Focus';
+When the session is not running, `server.js` spawns `wt.exe` directly via Node's `child_process.spawn`. The `cwd` path must be double-quoted in the constructed argument string to handle spaces in paths (e.g., `C:\Users\My Name\Projects\foo`).
+
+```js
+const resumeCmd = lastSessionId
+  ? `claude --resume ${lastSessionId}`
+  : `claude`;
+
+const wtArgs = [
+  '-w', '0',
+  'new-tab',
+  '--title', `[${label}]`,
+  '--startingDirectory', cwd,   // spawn() passes this as a separate argv element — no quoting needed
+  'cmd', '/k', resumeCmd,
+];
+
+spawn('wt.exe', wtArgs, { detached: true, stdio: 'ignore' }).unref();
 ```
 
-Timeout: revert to "Focus" after 2 seconds (same as existing behaviour).
+**Important:** Using `child_process.spawn` with an args array (not a shell string) means `cwd` and `label` are passed as discrete argv elements. No manual quoting or escaping is needed — Node handles the Windows argument encoding. Do NOT use `exec` or shell: true for this call.
+
+---
+
+### 6. `web/src/Drawer.jsx` — Focus button feedback
+
+```jsx
+const [focusLabel, setFocusLabel] = React.useState('Focus');
+
+async function handleFocus() {
+  const res = await fetch(`/api/sessions/${project}/focus`, { method: 'POST' });
+  const data = await res.json();
+  const next = data.focused ? 'Focused!' : data.opened ? 'Opened!' : 'Focus';
+  setFocusLabel(next);
+  if (next !== 'Focus') {
+    setTimeout(() => setFocusLabel('Focus'), 2000);
+  }
+}
+```
+
+A single `setTimeout` resets the label for both "Focused!" and "Opened!" states. The `if (next !== 'Focus')` guard avoids a no-op timer on silent failure.
 
 ---
 
@@ -173,10 +214,10 @@ Timeout: revert to "Focus" after 2 seconds (same as existing behaviour).
 
 | File | Change |
 |---|---|
-| `session-hook.js` | Write `lastSessionId` to meta on `SessionStart` |
-| `src/server.js` | Enhance focus endpoint: liveness check, UI Automation, open-if-not-running |
-| `src/focusTab.ps1` | New — PowerShell UI Automation tab switcher |
-| `web/src/Drawer.jsx` | Show "Opened!" on `{ opened: true }` |
+| `~/.claude/session-hook.js` | Write `lastSessionId` to meta on `SessionStart` |
+| `src/server.js` | Enhance focus endpoint: liveness check, PS1 invocation, race re-check, open-if-not-running |
+| `src/focusTab.ps1` | New — PowerShell UI Automation tab switcher using regex matching |
+| `web/src/Drawer.jsx` | Show "Opened!" on `{ opened: true }`; single timer for all non-default states |
 
 ---
 
@@ -184,20 +225,35 @@ Timeout: revert to "Focus" after 2 seconds (same as existing behaviour).
 
 | Scenario | Handling |
 |---|---|
-| `focusTab.ps1` exits 1 (no WT) | Skip tab switch; attempt `wt.exe` spawn anyway |
-| `focusTab.ps1` exits 2 (tab not found) | Return `{ focused: false, opened: false }` — tab title may not match yet |
-| `wt.exe` spawn fails | Catch, return `{ focused: false, opened: false }` |
-| `cwd` missing from meta | Use project name as fallback directory |
-| Session pid is 0 or undefined | Treat as not running |
+| `focusTab.ps1` exits 0 | Return `{ focused: true, opened: false }` HTTP 200 |
+| `focusTab.ps1` exits 1 (no WT) | Session is alive but WT not found — return `{ focused: false, opened: false }` HTTP 200; do NOT spawn |
+| `focusTab.ps1` exits 2 (tab not found, session alive) | Re-check liveness; if still alive return `{ focused: false, opened: false }` HTTP 200; if now dead fall through to open-new-tab |
+| `focusTab.ps1` exits 2 (tab not found, session now dead) | Open new tab as if session was not running |
+| `wt.exe` spawn fails | Catch error, return `{ focused: false, opened: false }` HTTP 200 |
+| `cwd` missing from meta | Use project name as fallback for `--startingDirectory`; pass it via spawn args array (no escaping needed) |
+| Session pid is 0 or undefined | `isAlive` returns false; treat as not running |
+| Label contains regex metacharacters (`[`, `]`, `*`, etc.) | `[Regex]::Escape` in PS1 handles all cases |
+
+---
+
+## Constraints
+
+- Project labels must not be empty strings (enforced by the existing rename validation in the Drawer).
+- `wt.exe` must be on PATH (standard for Windows Terminal installs). If not found, spawn fails and `{ focused: false, opened: false }` is returned.
 
 ---
 
 ## Testing
 
-- **Focus running session:** click Focus with session active → correct tab becomes active in WT
-- **Open not-running (with lastSessionId):** click Focus on idle project → new WT tab opens, `claude --resume` runs
+- **Focus running session:** click Focus with session active → correct tab becomes active in WT, WT brought to front
+- **Open not-running (with lastSessionId):** click Focus on idle project → new WT tab opens, `claude --resume <uuid>` runs in correct directory
 - **Open not-running (no lastSessionId):** same but fresh `claude` starts
-- **Tab title mismatch:** session title changed mid-run → Focus falls back to window-level
-- **WT minimised:** SW_RESTORE restores the window before SetForegroundWindow
-- **Multiple WT windows:** first WT process is used (documented limitation)
-- **Drawer feedback:** "Focused!" vs "Opened!" vs silent displayed correctly
+- **Race: session dies between liveness check and PS1 run:** PS1 exits 2, re-check confirms dead, new tab opened with resume
+- **Exit code 1 (no WT, session alive):** returns `{ focused: false, opened: false }`, no spawn attempted
+- **Tab not found, session alive (exit 2):** WT is still brought to front; returns `{ focused: false, opened: false }`
+- **Label with special characters (`[test]`, `my*project`):** regex escaping ensures correct match; no silent mismatch
+- **Path with spaces (`C:\Users\My Name\Projects\foo`):** spawn args array handles correctly; tab opens in right directory
+- **WT minimised:** SW_RESTORE restores before SetForegroundWindow
+- **Drawer feedback:** "Focused!" → 2s → "Focus"; "Opened!" → 2s → "Focus"; silent failure stays "Focus"
+- **HTTP status:** all outcomes return 200
+- **process-discovered session gets SessionStart hook late:** `lastSessionId` written at that point; next Focus will resume correctly
