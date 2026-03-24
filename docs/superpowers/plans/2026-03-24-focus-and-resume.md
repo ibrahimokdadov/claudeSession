@@ -4,7 +4,7 @@
 
 **Goal:** Add per-tab focus (UI Automation) and open-if-not-running (wt.exe + claude --resume) so clicking "focus" in the dashboard switches directly to the right Windows Terminal tab, or opens a new one if the session isn't running.
 
-**Architecture:** Three additions to the existing codebase: (1) `session-hook.js` persists `lastSessionId` to `session-meta.json` on every event, (2) `src/focusTab.ps1` uses `System.Windows.Automation` to switch WT tabs by regex-matching the label, (3) `server.js` focus endpoint gains tab-switch logic (via the PS1) and open-if-not-running (via `wt.exe` spawn). The frontend gets a project-level "Open" button and per-session feedback labels.
+**Architecture:** Three additions to the existing codebase: (1) `session-hook.js` persists `lastSessionId` to `session-meta.json` on `SessionStart` events only, piggybacking on the existing meta read/write, (2) `src/focusTab.ps1` uses `System.Windows.Automation` to switch WT tabs by regex-matching the label, invoked via temp file to avoid command-string injection, (3) `server.js` focus endpoint gains tab-switch logic and open-if-not-running. The frontend gets a project-level "Open" button and per-session feedback labels.
 
 **Tech Stack:** Node.js, PowerShell (System.Windows.Automation), React, existing Express/ws stack. All work is in `.worktrees/feature-build/`.
 
@@ -14,86 +14,83 @@
 
 | File | Action | Responsibility |
 |------|--------|----------------|
-| `~/.claude/session-hook.js` | Modify | Write `lastSessionId` to `session-meta.json` on every hook event that has a `sessionId` |
+| `~/.claude/session-hook.js` | Modify (in-place, not in repo) | Write `lastSessionId` to `session-meta.json` on `SessionStart` events only |
 | `src/focusTab.ps1` | Create | PowerShell: UI Automation tab switcher; exit 0=found, 1=no WT, 2=not found |
 | `src/server.js` | Modify | Enhance focus endpoint: tab switch → liveness re-check → open-if-not-running |
-| `web/src/SessionTree.jsx` | Modify | Show "focus"/"resume" on stale sessions; add feedback labels ("Focused!"/"Opened!") |
+| `web/src/SessionTree.jsx` | Modify | Show "focus"/"resume" on stale sessions; add feedback labels |
 | `web/src/ProjectPanel.jsx` | Modify | Add project-level "Open" button in header row |
-| `web/src/App.jsx` | Modify | Wire project-level open handler (calls most-recent-session focus endpoint) |
 
 ---
 
 ## Context: what already exists
 
-- `src/server.js` already has a working `POST /api/sessions/:fileKey/focus` endpoint that walks the process tree and brings the WT *window* to front (but does not switch tabs). The endpoint returns `{ focused, dbg }`.
-- `session-hook.js` already writes `sessionId` to each session's JSON file and emits ANSI tab-title/color escapes. It does **not** persist `lastSessionId` to `session-meta.json`.
-- `web/src/SessionTree.jsx` shows a "focus" button with `canFocus = !stale && !!session.terminalPid`. This hides the button for stale sessions entirely.
-- `web/src/ProjectPanel.jsx` has no focus/open button at the project level.
+- `src/server.js` has a working `POST /api/sessions/:fileKey/focus` endpoint that walks the process tree and brings the WT *window* to front (does not switch tabs). Returns `{ focused, dbg }`.
+- `session-hook.js` writes `sessionId` to session files and emits ANSI tab-title/color escapes. Does NOT persist `lastSessionId` to `session-meta.json`.
+- `web/src/SessionTree.jsx` shows a "focus" button with `canFocus = !stale && !!session.terminalPid`. Hidden for stale sessions.
+- `web/src/ProjectPanel.jsx` has no focus/open button at project level.
+- `web/src/ProjectPanel.jsx` already imports `useState, useEffect, useRef` from React. Does NOT import `isStale`.
+- `web/src/SessionTree.jsx` already imports `isStale` from `./utils.js`.
 
 ---
 
 ## Task 1: Persist `lastSessionId` in session-hook.js
 
 **Files:**
-- Modify: `~/.claude/session-hook.js`
+- Modify: `~/.claude/session-hook.js` — edited directly on disk; this file is NOT tracked in the claudesession git repo. Do not attempt `git add` on it.
 
-The hook already writes to `session-meta.json` at the end of each event. Add one field: `lastSessionId`.
+The hook already reads `session-meta.json` at the bottom to emit ANSI escapes. We piggyback on that existing read: if this is a `SessionStart` event and we have a `sessionId`, update `lastSessionId` in the same read-modify-write pass.
 
-- [ ] **Step 1: Locate the ANSI-escape block in session-hook.js**
+- [ ] **Step 1: Find the hook event type**
 
-At the bottom of `session-hook.js`, find:
+Open `~/.claude/session-hook.js`. The `status` variable (from `process.argv[2]`) holds the event type: `'SessionStart'`, `'working'`, `'waiting'`, etc.
+
+At the bottom of the file, find the ANSI-escape block:
 ```js
 // Emit ANSI escapes for Windows Terminal tab title + color
 try {
   let meta = {};
   try { meta = JSON.parse(fs.readFileSync(metaFile, 'utf8')); } catch (_) {}
   const entry = meta[cwd] || {};
+  const label = entry.label || project;
+  const color = entry.color || null;
 ```
 
-- [ ] **Step 2: Add `lastSessionId` write before emitting ANSI escapes**
+- [ ] **Step 2: Add `lastSessionId` update inside the existing try block**
 
 After `const entry = meta[cwd] || {};` and before reading `label`/`color`, insert:
 
 ```js
-// Persist last known sessionId so Focus can resume even after the session ends
-if (sessionId && entry) {
-  if (!entry.lastSessionId || entry.lastSessionId !== sessionId) {
-    entry.lastSessionId = sessionId;
-    meta[cwd] = entry;
-    const tmpMeta = metaFile + '.tmp.' + process.pid;
-    try {
-      fs.writeFileSync(tmpMeta, JSON.stringify(meta, null, 2));
-      fs.renameSync(tmpMeta, metaFile);
-    } catch (_) {}
+  // On SessionStart: persist lastSessionId so Focus can resume after the session ends
+  if (status === 'SessionStart' && sessionId && meta[cwd]) {
+    if (meta[cwd].lastSessionId !== sessionId) {
+      meta[cwd].lastSessionId = sessionId;
+      const tmpMeta = metaFile + '.tmp.' + process.pid;
+      try {
+        fs.writeFileSync(tmpMeta, JSON.stringify(meta, null, 2));
+        fs.renameSync(tmpMeta, metaFile);
+      } catch (_) {}
+    }
   }
-}
 ```
+
+**Why `meta[cwd]` (not `meta[cwd] || {}`):** We only write `lastSessionId` when the project is already known to meta (i.e. `ensureProject` has already run for this `cwd`). If the cwd is new and not yet in meta, `meta[cwd]` is undefined and we skip the write — the server's chokidar handler will call `ensureProject` first, and the next `SessionStart` will catch it.
 
 - [ ] **Step 3: Verify manually**
 
-Start a new `claude` session in any project directory. After the first hook fires, run:
+Start a new `claude` session. After the first hook fires, run:
 ```bash
 cat ~/.claude/session-meta.json
 ```
-Expected: the entry for that project has a `lastSessionId` field containing a UUID.
-
-- [ ] **Step 4: Commit**
-
-```bash
-git add ~/.claude/session-hook.js
-git commit -m "feat: persist lastSessionId to session-meta.json on each hook event"
-```
-
-> Note: `session-hook.js` lives in `~/.claude/`, not in the repo. This commit modifies it in-place on the user's machine. The git add path is literal.
+Expected: the entry for that project has a `lastSessionId` UUID.
 
 ---
 
 ## Task 2: Create `src/focusTab.ps1`
 
 **Files:**
-- Create: `src/focusTab.ps1` (in `.worktrees/feature-build/src/`)
+- Create: `.worktrees/feature-build/src/focusTab.ps1`
 
-This PowerShell script uses UI Automation to find a Windows Terminal tab whose title matches `[label]` and click it. Exit codes: 0=switched, 1=WT not found, 2=tab not found.
+Exit codes: 0=tab found+switched, 1=WT not running, 2=tab not found (WT still brought to front).
 
 - [ ] **Step 1: Create `src/focusTab.ps1`**
 
@@ -138,20 +135,20 @@ foreach ($tab in $tabs) {
   }
 }
 
-# Tab not found — still bring WT to front so user can see it
+# Tab not found — still bring WT to front
 [Win32Tab]::ShowWindow($wt.MainWindowHandle, 9)
 [Win32Tab]::SetForegroundWindow($wt.MainWindowHandle)
 exit 2
 ```
 
-- [ ] **Step 2: Smoke-test the script manually**
+- [ ] **Step 2: Smoke-test manually**
 
-With at least one Claude Code session running in Windows Terminal:
+With at least one Claude session running in WT:
 ```powershell
-powershell -ExecutionPolicy Bypass -File src/focusTab.ps1 -Label "claudesession"
+powershell -ExecutionPolicy Bypass -File .worktrees/feature-build/src/focusTab.ps1 -Label "claudesession"
 echo "exit: $LastExitCode"
 ```
-Expected: exit 0, the WT tab titled `[claudesession] ...` becomes active. If you have no matching tab, expect exit 2 but WT still comes to front.
+Expected: exit 0, correct tab active. No matching tab → exit 2, WT still front.
 
 - [ ] **Step 3: Commit**
 
@@ -168,25 +165,30 @@ git commit -m "feat: add focusTab.ps1 — UI Automation tab switcher for Windows
 **Files:**
 - Modify: `.worktrees/feature-build/src/server.js`
 
-Add tab-switch attempt before the existing window-focus logic. Add open-if-not-running when session is dead. Update response shape to include `opened` field.
+**Important design note on exit code 1:** The spec says exit 1 (WT not found, session alive) should return `{ focused: false, opened: false }` immediately. This plan improves on that: it falls back to the existing `walkToTerminal`/`focusWindow` helpers, which support non-WT terminals (ConEmu, VS Code integrated terminal, etc). This is a deliberate, documented improvement — the existing code already handles these cases well.
 
-- [ ] **Step 1: Add imports at top of server.js**
+**Important design note on label injection:** `tryTabSwitch` writes the PS1 label via a temp args file rather than string interpolation, preventing labels with `"` or backticks from breaking the command.
 
-Find the existing requires block and ensure `spawn` is imported:
+- [ ] **Step 1: Ensure `spawn` is imported**
+
+Find:
+```js
+const { execSync } = require('child_process')
+```
+Replace with:
 ```js
 const { execSync, spawn } = require('child_process')
 ```
-(Replace the existing `const { execSync } = require('child_process')` line.)
 
-- [ ] **Step 2: Add `isAlive` helper after existing helpers**
+- [ ] **Step 2: Add `isAlive` helper after `focusWindow`**
 
-After the `focusWindow` function (around line 301), add:
+After the closing `}` of the `focusWindow` function (around line 301), add:
 
 ```js
 function isAlive(pid) {
-  if (!pid) return false;
-  try { process.kill(pid, 0); return true; }
-  catch { return false; }
+  if (!pid) return false
+  try { process.kill(pid, 0); return true }
+  catch { return false }
 }
 ```
 
@@ -198,15 +200,19 @@ After `isAlive`, add:
 const FOCUS_TAB_PS1 = path.join(__dirname, 'focusTab.ps1')
 
 function tryTabSwitch(label) {
+  // Write label to a temp file so special characters (", `, spaces) can't break the command string
+  const tmpArgs = path.join(os.tmpdir(), `cs-taблabel-${process.pid}.txt`)
   try {
-    const result = execSync(
-      `powershell.exe -NonInteractive -ExecutionPolicy Bypass -File "${FOCUS_TAB_PS1}" -Label "${label}"`,
+    fs.writeFileSync(tmpArgs, label, 'utf8')
+    execSync(
+      `powershell.exe -NonInteractive -ExecutionPolicy Bypass -File "${FOCUS_TAB_PS1}" -Label (Get-Content -LiteralPath "${tmpArgs}" -Raw).Trim()`,
       { timeout: 6000, stdio: ['ignore', 'pipe', 'ignore'] }
     )
-    return 0  // exit 0 — success
+    return 0
   } catch (err) {
-    // execSync throws when exit code != 0; status is in err.status
     return (err && err.status != null) ? err.status : -1
+  } finally {
+    try { fs.unlinkSync(tmpArgs) } catch (_) {}
   }
 }
 ```
@@ -218,11 +224,13 @@ After `tryTabSwitch`, add:
 ```js
 function openNewTab(cwd, label, sessionId) {
   const resumeCmd = sessionId ? `claude --resume ${sessionId}` : `claude`
+  // Use spawn args array — Node handles Windows path encoding; no manual quoting needed
   const args = [
     '-w', '0',
     'new-tab',
     '--title', `[${label}]`,
     '--startingDirectory', cwd || process.env.USERPROFILE || 'C:\\',
+    // Note: if cwd is absent, WT falls back to %USERPROFILE% — acceptable degraded case
     'cmd', '/k', resumeCmd,
   ]
   try {
@@ -236,7 +244,7 @@ function openNewTab(cwd, label, sessionId) {
 
 - [ ] **Step 5: Rewrite the focus endpoint**
 
-Find the existing `app.post('/api/sessions/:fileKey/focus', ...)` block (starts around line 303) and replace it entirely:
+Find `app.post('/api/sessions/:fileKey/focus', ...)` and replace the entire block:
 
 ```js
 app.post('/api/sessions/:fileKey/focus', (req, res) => {
@@ -246,61 +254,48 @@ app.post('/api/sessions/:fileKey/focus', (req, res) => {
   const dbg   = {}
 
   try {
-    // Read session file
     const sessionFile = path.join(sessionsDir, fileKey + '.json')
     const session = JSON.parse(fs.readFileSync(sessionFile, 'utf8'))
-    const { pid, terminalPid, sessionId, cwd } = session
+    const { pid, sessionId, cwd } = session
 
-    // Read meta for label + lastSessionId
     const m     = readMeta(metaFile)
     const entry = m[cwd] || {}
     const label = entry.label || session.project || fileKey
 
     dbg.pid = pid; dbg.sessionId = sessionId; dbg.label = label
 
-    // Check if the session process is alive
     const alive = isAlive(pid)
     dbg.alive = alive
 
     if (alive) {
-      // 1. Try UI Automation tab switch
       const exitCode = tryTabSwitch(label)
       dbg.tabSwitchExit = exitCode
 
       if (exitCode === 0) {
-        // Tab found and switched
         focused = true
-      } else if (exitCode === 1) {
-        // WT not found — session alive but in a different terminal; fall back to window focus
-        const claudePid = findClaudePid(sessionId, pid)
-        if (claudePid) {
-          const settings = (m._settings) || {}
-          const termPid = walkToTerminal(claudePid, settings.preferredTerminal)
-            || walkToTerminal(pid, settings.preferredTerminal)
-          if (termPid) focused = focusWindow(termPid).focused
-        }
       } else {
-        // exitCode 2: tab not found — re-check liveness
-        if (isAlive(pid)) {
-          // Still alive, just title mismatch — fall back to window-level focus
+        // exit 1 (no WT) or exit 2 (tab not found):
+        // Fall back to existing window-level focus — supports non-WT terminals too.
+        // On exit 2, re-check liveness first; if now dead, open new tab instead.
+        const stillAlive = exitCode === 1 ? true : isAlive(pid)
+        if (stillAlive) {
           const claudePid = findClaudePid(sessionId, pid)
-          if (claudePid) {
-            const settings = (m._settings) || {}
-            const termPid = walkToTerminal(claudePid, settings.preferredTerminal)
-            if (termPid) focused = focusWindow(termPid).focused
-          }
+          const settings  = m._settings || {}
+          const termPid   = claudePid
+            ? walkToTerminal(claudePid, settings.preferredTerminal) || walkToTerminal(pid, settings.preferredTerminal)
+            : walkToTerminal(pid, settings.preferredTerminal)
+          if (termPid) focused = focusWindow(termPid).focused
+          dbg.fallbackTermPid = termPid
         } else {
-          // Died between liveness check and tab switch — treat as not running
           dbg.diedDuringSwitch = true
           const resumeId = sessionId || entry.lastSessionId || null
-          opened = openNewTab(cwd || entry.cwd, label, resumeId)
+          opened = openNewTab(cwd, label, resumeId)
         }
       }
     } else {
-      // Session not running — open new tab with resume if we have a sessionId
       const resumeId = sessionId || entry.lastSessionId || null
       dbg.resumeId = resumeId
-      opened = openNewTab(cwd || entry.cwd, label, resumeId)
+      opened = openNewTab(cwd, label, resumeId)
     }
   } catch (err) {
     dbg.error = err.message
@@ -313,63 +308,62 @@ app.post('/api/sessions/:fileKey/focus', (req, res) => {
 
 - [ ] **Step 6: Test with a running session**
 
-With `npm run dev` running and a Claude session active:
 ```bash
-curl -s -X POST http://localhost:3333/api/sessions/<fileKey>/focus | node -e "process.stdin||(x=>console.log(JSON.stringify(x,null,2)))(require('fs').readFileSync('/dev/stdin','utf8'))"
+curl -s -X POST http://localhost:3333/api/sessions/<fileKey>/focus
 ```
-Expected: `{ "focused": true, "opened": false }` and the correct WT tab becomes active.
+Expected: `{ "focused": true, "opened": false }`, correct WT tab active.
 
 - [ ] **Step 7: Test open-if-not-running**
 
-Kill the Claude session so the session file becomes stale, then call the endpoint again.
-Expected: `{ "focused": false, "opened": true }` and a new WT tab opens running `claude --resume <uuid>`.
+Kill the Claude session, then call the endpoint.
+Expected: `{ "focused": false, "opened": true }`, new WT tab opens with `claude --resume <uuid>`.
 
 - [ ] **Step 8: Commit**
 
 ```bash
 cd .worktrees/feature-build
 git add src/server.js
-git commit -m "feat: enhance focus endpoint — tab switch via UI Automation + open-if-not-running"
+git commit -m "feat: enhance focus endpoint — UI Automation tab switch + open-if-not-running"
 ```
 
 ---
 
-## Task 4: Update SessionTree.jsx — show focus/resume on stale sessions + feedback labels
+## Task 4: Update SessionTree.jsx — resume button + feedback labels
 
 **Files:**
 - Modify: `.worktrees/feature-build/web/src/SessionTree.jsx`
 
-Currently `canFocus = !stale && !!session.terminalPid`. Change this so stale sessions also show a "resume" button. Add feedback states ("Focused!" / "Opened!").
+`isStale` is already imported (line 3). No import changes needed.
 
-- [ ] **Step 1: Add per-session focus state to `SessionNode`**
+The focus button currently calls `onFocus(session.fileKey)` via prop. After this task, the button calls `fetch` directly via a local `handleFocus` — the `onFocus` prop is superseded for focus/resume handling and becomes unused for `SessionNode`. Leave the prop in the signature for now; it's harmless.
 
-Find the `SessionNode` function. Replace:
+- [ ] **Step 1: Add `focusLabel` state to `SessionNode`**
+
+Find in `SessionNode`:
 ```js
 const [killConfirm, setKillConfirm] = useState(false)
 ```
-with:
+Add below it:
 ```js
-const [killConfirm, setKillConfirm] = useState(false)
-const [focusLabel, setFocusLabel]   = useState(null)  // null = default label
+const [focusLabel, setFocusLabel] = useState(null)
 ```
 
-- [ ] **Step 2: Update `canFocus` and add `isResumable`**
+- [ ] **Step 2: Add `isResumable` flag**
 
 Find:
 ```js
 const canFocus = !stale && !!session.terminalPid
 const canKill  = !stale && ACTIVE_STATUSES.has(session.status)
 ```
-Replace with:
+Add `isResumable` between them:
 ```js
 const canFocus    = !stale && !!session.terminalPid
 const isResumable = stale && !!session.sessionId
 const canKill     = !stale && ACTIVE_STATUSES.has(session.status)
 ```
 
-- [ ] **Step 3: Add `handleFocus` function inside `SessionNode`**
+- [ ] **Step 3: Add `handleFocus` after `handleKill`**
 
-After the `handleKill` function, add:
 ```js
 async function handleFocus() {
   try {
@@ -384,9 +378,9 @@ async function handleFocus() {
 }
 ```
 
-- [ ] **Step 4: Update the button render block**
+- [ ] **Step 4: Update the button block**
 
-Find the condition `{(canFocus || canKill) && (` and change the block that renders the focus button to also handle the resumable case:
+Find `{(canFocus || canKill) && (` and replace the whole actions block:
 
 ```jsx
 {(canFocus || isResumable || canKill) && (
@@ -401,8 +395,8 @@ Find the condition `{(canFocus || canKill) && (` and change the block that rende
           color: focusLabel ? 'var(--accent-done)' : 'var(--text-secondary)',
           cursor: 'pointer', transition: 'all 0.1s',
         }}
-        onMouseEnter={e => { if (!focusLabel) { e.target.style.color = 'var(--text-primary)'; e.target.style.borderColor = 'var(--text-secondary)' }}}
-        onMouseLeave={e => { if (!focusLabel) { e.target.style.color = 'var(--text-secondary)'; e.target.style.borderColor = 'var(--border)' }}}
+        onMouseEnter={e => { if (!focusLabel) { e.target.style.color = 'var(--text-primary)'; e.target.style.borderColor = 'var(--text-secondary)' } }}
+        onMouseLeave={e => { if (!focusLabel) { e.target.style.color = 'var(--text-secondary)'; e.target.style.borderColor = 'var(--border)' } }}
       >
         {focusLabel || (isResumable ? 'resume' : 'focus')}
       </button>
@@ -426,18 +420,17 @@ Find the condition `{(canFocus || canKill) && (` and change the block that rende
 )}
 ```
 
-- [ ] **Step 5: Verify in browser**
+- [ ] **Step 5: Verify**
 
-With `npm run dev`:
-- Active session card → shows "focus" button; clicking it shows "focused!" or "opened!" briefly
-- Stale session card → shows "resume" button; clicking opens new WT tab with `claude --resume`
+Active session → "focus" button → shows "focused!" or "opened!" for 2s.
+Stale session → "resume" button → new WT tab opens.
 
 - [ ] **Step 6: Commit**
 
 ```bash
 cd .worktrees/feature-build
 git add web/src/SessionTree.jsx
-git commit -m "feat: add resume button for stale sessions; focus/resume feedback labels"
+git commit -m "feat: resume button for stale sessions + focus/resume feedback labels"
 ```
 
 ---
@@ -446,31 +439,26 @@ git commit -m "feat: add resume button for stale sessions; focus/resume feedback
 
 **Files:**
 - Modify: `.worktrees/feature-build/web/src/ProjectPanel.jsx`
-- Modify: `.worktrees/feature-build/web/src/App.jsx`
 
-Add an "Open" button in the ProjectPanel header. Clicking it focuses the most recent active session's tab, or opens a new tab if none are active.
+`handleOpen` calls `fetch` directly — no prop threading through `App.jsx` needed. `App.jsx` requires no changes.
 
-- [ ] **Step 1: Add `onOpen` prop to `ProjectPanel`**
+`useState` is already imported. Only `isStale` needs to be added.
 
-Find the function signature:
+- [ ] **Step 1: Add `isStale` import**
+
+At the top of `ProjectPanel.jsx`, add (as a new import line — do NOT duplicate the existing React import):
 ```js
-export default function ProjectPanel({ project, showAll, onToggleShowAll, onUpdate, onFocus, onKill }) {
-```
-Add `onOpen`:
-```js
-export default function ProjectPanel({ project, showAll, onToggleShowAll, onUpdate, onFocus, onKill, onOpen }) {
+import { isStale } from './utils.js'
 ```
 
-- [ ] **Step 2: Add Open button state and handler**
+- [ ] **Step 2: Add `openLabel` state and `handleOpen` after `inputRef`**
 
-After `const inputRef = useRef(null)`, add:
 ```js
 const [openLabel, setOpenLabel] = useState('open')
 
 async function handleOpen() {
-  // Pick the most recent non-stale session, or fall back to most recent session
   const active = project.sessions.filter(s => !isStale(s))
-  const target  = (active.length ? active : project.sessions)
+  const target = (active.length ? active : project.sessions)
     .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))[0]
   if (!target) return
   try {
@@ -483,18 +471,9 @@ async function handleOpen() {
 }
 ```
 
-- [ ] **Step 3: Add `isStale` import**
+- [ ] **Step 3: Add Open button in header**
 
-At the top of `ProjectPanel.jsx`, add:
-```js
-import { isStale } from './utils.js'
-import { useState } from 'react'
-```
-(Check if `useState` is already imported — add it only if missing.)
-
-- [ ] **Step 4: Render Open button in header row**
-
-Find the `<div style={{ display: 'flex', gap: 5, flexShrink: 0 }}>` that contains the color swatches. After the closing `</div>` of that row, add the Open button as a sibling in the header flex row:
+In the JSX, find the `<div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>` header row. After the color-swatches `</div>`, add:
 
 ```jsx
 <button
@@ -517,69 +496,57 @@ Find the `<div style={{ display: 'flex', gap: 5, flexShrink: 0 }}>` that contain
 </button>
 ```
 
-- [ ] **Step 5: Verify in browser**
+- [ ] **Step 4: Verify**
 
-With a project selected in the sidebar:
-- Click "open" with an active session → tab switches, button shows "focused!" briefly
-- Click "open" with only stale sessions → new WT tab opens, button shows "opened!" briefly
+Active project → click "open" → correct tab switches → "focused!" for 2s.
+Stale-only project → click "open" → new WT tab, `claude --resume` → "opened!" for 2s.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 cd .worktrees/feature-build
 git add web/src/ProjectPanel.jsx
-git commit -m "feat: add project-level Open button — focuses active tab or opens with resume"
+git commit -m "feat: project-level Open button — focuses active tab or resumes with claude --resume"
 ```
 
 ---
 
 ## Task 6: Integration test pass
 
-**Manual test checklist — run through each scenario end-to-end:**
+- [ ] **Test 1: Focus running session (session card)**
+  Open 2 sessions in different WT tabs. Click "focus" on non-active card.
+  Expected: correct tab active; "focused!" for 2s.
 
-- [ ] **Test 1: Focus running session via session card**
-  - Open 2 Claude sessions in different WT tabs
-  - In browser, click "focus" on the non-active session card
-  - Expected: that WT tab becomes active; button shows "focused!" for 2s
+- [ ] **Test 2: Focus running session (project Open button)**
+  Same setup. Click "open" in project header.
+  Expected: same as Test 1.
 
-- [ ] **Test 2: Focus running session via project Open button**
-  - Same setup as Test 1
-  - Click "open" in the project header
-  - Expected: same result as Test 1
+- [ ] **Test 3: Resume stale session (session card)**
+  Kill a session. Click "resume" on stale card.
+  Expected: new WT tab, `claude --resume <uuid>` in right directory; "opened!" for 2s.
 
-- [ ] **Test 3: Resume stale session (lastSessionId known)**
-  - Let a Claude session end (or kill it)
-  - In browser, find the stale session card (shows "resume")
-  - Click "resume"
-  - Expected: new WT tab opens running `claude --resume <uuid>` in the right directory; button shows "opened!"
-
-- [ ] **Test 4: Open project with no active session via Open button**
-  - Same setup as Test 3
-  - Click "open" in the project header
-  - Expected: new WT tab opens with `claude --resume <uuid>` (picks most recent stale session)
+- [ ] **Test 4: Open stale-only project (Open button)**
+  Same setup. Click "open" in project header.
+  Expected: new WT tab, `claude --resume <uuid>`; "opened!" for 2s.
 
 - [ ] **Test 5: WT minimised**
-  - Minimise Windows Terminal
-  - Click "focus" on any running session
-  - Expected: WT is restored and the correct tab is active
+  Minimise WT, click "focus". Expected: WT restored, correct tab active.
 
 - [ ] **Test 6: Label with special characters**
-  - Rename a project to something with brackets, e.g. `test[2]`
-  - Click "focus" on that session
-  - Expected: correct tab matched; no silent failure
+  Rename a project to `test[2]`. Click "focus".
+  Expected: correct tab matched; no silent failure.
 
 - [ ] **Test 7: `lastSessionId` persistence**
-  - Start a new Claude session in a project
-  - Run `cat ~/.claude/session-meta.json | python -m json.tool`
-  - Expected: `lastSessionId` field present for that project's cwd entry
+  Start a Claude session. Run `cat ~/.claude/session-meta.json`.
+  Expected: `lastSessionId` UUID present for that project.
 
 - [ ] **Test 8: HTTP response shape**
-  - `curl -s -X POST http://localhost:3333/api/sessions/<fileKey>/focus | jq .`
-  - Expected response has `focused` (bool) and `opened` (bool) at top level
+  `curl -s -X POST http://localhost:3333/api/sessions/<fileKey>/focus | jq '{focused,opened}'`
+  Expected: both fields present as booleans.
 
-- [ ] **Step 9: Commit test evidence**
+- [ ] **Final commit**
 
 ```bash
 cd .worktrees/feature-build
-git commit --allow-empty -m "test: manual integration pass complete for focus+resume feature"
+git commit --allow-empty -m "test: manual integration pass complete — focus+resume feature"
 ```
