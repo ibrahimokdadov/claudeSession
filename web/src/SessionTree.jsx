@@ -33,11 +33,13 @@ function buildTree(sessions) {
 
 function SessionNode({ session, depth, isLast, onFocus, onKill }) {
   const [killConfirm, setKillConfirm] = useState(false)
+  const [focusLabel, setFocusLabel] = useState(null)
   const timeAgo = useRelativeTime(session.timestamp)
   const stale = isStale(session)
   const meta = STATUS_META[session.status] || STATUS_META.running
-  const canFocus = !stale && !!session.terminalPid
-  const canKill  = !stale && ACTIVE_STATUSES.has(session.status)
+  const canFocus    = !stale && !!session.terminalPid
+  const isResumable = stale && !!session.sessionId
+  const canKill     = !stale && ACTIVE_STATUSES.has(session.status)
 
   function handleKill() {
     if (!killConfirm) {
@@ -47,6 +49,18 @@ function SessionNode({ session, depth, isLast, onFocus, onKill }) {
       setKillConfirm(false)
       onKill(session.fileKey)
     }
+  }
+
+  async function handleFocus() {
+    try {
+      const r = await fetch(`/api/sessions/${encodeURIComponent(session.fileKey)}/focus`, { method: 'POST' })
+      const d = await r.json()
+      const next = d.focused ? 'focused!' : d.opened ? 'opened!' : null
+      if (next) {
+        setFocusLabel(next)
+        setTimeout(() => setFocusLabel(null), 2000)
+      }
+    } catch (_) {}
   }
 
   return (
@@ -118,22 +132,23 @@ function SessionNode({ session, depth, isLast, onFocus, onKill }) {
           </div>
         )}
 
-        {/* Action buttons — only on non-stale sessions */}
-        {(canFocus || canKill) && (
+        {/* Action buttons */}
+        {(canFocus || isResumable || canKill) && (
           <div style={{ display: 'flex', gap: 5, marginTop: 5, paddingLeft: 12 }}>
-            {canFocus && (
+            {(canFocus || isResumable) && (
               <button
-                onClick={() => onFocus(session.fileKey)}
+                onClick={handleFocus}
                 style={{
                   fontSize: 9, fontFamily: 'var(--font-mono)',
                   border: '1px solid var(--border)', borderRadius: 3,
                   padding: '2px 9px', background: 'var(--bg-tertiary)',
-                  color: 'var(--text-secondary)', cursor: 'pointer', transition: 'all 0.1s',
+                  color: focusLabel ? 'var(--accent-done)' : 'var(--text-secondary)',
+                  cursor: 'pointer', transition: 'all 0.1s',
                 }}
-                onMouseEnter={e => { e.target.style.color = 'var(--text-primary)'; e.target.style.borderColor = 'var(--text-secondary)' }}
-                onMouseLeave={e => { e.target.style.color = 'var(--text-secondary)'; e.target.style.borderColor = 'var(--border)' }}
+                onMouseEnter={e => { if (!focusLabel) { e.target.style.color = 'var(--text-primary)'; e.target.style.borderColor = 'var(--text-secondary)' } }}
+                onMouseLeave={e => { if (!focusLabel) { e.target.style.color = 'var(--text-secondary)'; e.target.style.borderColor = 'var(--border)' } }}
               >
-                focus
+                {focusLabel || (isResumable ? 'resume' : 'focus')}
               </button>
             )}
             {canKill && (
