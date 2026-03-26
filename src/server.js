@@ -5,7 +5,7 @@ const chokidar   = require('chokidar')
 const fs         = require('fs')
 const os         = require('os')
 const path       = require('path')
-const { execSync } = require('child_process')
+const { execSync, spawn } = require('child_process')
 const { readMeta, writeMeta, ensureProject } = require('./meta.js')
 const { loadAll, updateFromFile, removeByFile, getAll, getByFileKey, store, sessionsDir, metaFile } = require('./sessions.js')
 
@@ -169,7 +169,13 @@ function findClaudePid(sessionId, fallbackPid) {
       if (!/^\d+\.json$/.test(f)) continue
       try {
         const d = JSON.parse(fs.readFileSync(path.join(sessionsDir, f), 'utf8'))
-        if (d.sessionId === sessionId) return d.pid
+        if (d.sessionId !== sessionId || !d.pid) continue
+        // Verify it's still alive
+        const alive = execSync(
+          `powershell.exe -NonInteractive -Command "if (Get-Process -Id ${d.pid} -EA SilentlyContinue) { 'alive' }"`,
+          { timeout: 2000, stdio: ['ignore', 'pipe', 'ignore'] }
+        ).toString().trim()
+        if (alive === 'alive') return d.pid
       } catch (_) {}
     }
   } catch (_) {}
@@ -177,7 +183,7 @@ function findClaudePid(sessionId, fallbackPid) {
   // 2. WMI scan for Claude process with --resume <sessionId>
   if (sessionId) {
     try {
-      const script = `Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*claude-code*cli.js*--resume*${sessionId}*' } | Select-Object -First 1 -ExpandProperty ProcessId`
+      const script = `Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'node.exe' -and $_.CommandLine -like '*claude-code*cli.js*--resume*${sessionId}*' } | Select-Object -First 1 -ExpandProperty ProcessId`
       const raw = execSync(`powershell.exe -NonInteractive -Command "${script}"`,
         { timeout: 4000, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim()
       if (raw && /^\d+$/.test(raw)) return parseInt(raw, 10)
@@ -208,7 +214,7 @@ function walkToTerminal(claudePid, preferredTerminal) {
       `$known = @(${knownList});`,
       `$p = ${claudePid};`,
       `for ($i = 0; $i -lt 12; $i++) {`,
-      `  $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$p" -EA SilentlyContinue;`,
+      `  $proc = Get-CimInstance Win32_Process | Where-Object ProcessId -eq $p | Select-Object -First 1;`,
       `  if (-not $proc) { break }`,
       `  $name = $proc.Name -replace '\\.exe$','';`,
       `  if ($name -in $known) { Write-Output $proc.ProcessId; break }`,
@@ -227,7 +233,7 @@ function focusWindow(termPid) {
   const tmpScript = path.join(os.tmpdir(), `cs-focus-${process.pid}.ps1`)
   const ps = `
 $proc = Get-Process -Id ${termPid} -ErrorAction SilentlyContinue
-if (-not $proc -or $proc.MainWindowHandle -eq 0) { exit }
+if (-not $proc -or $proc.MainWindowHandle -eq 0) { Write-Output "no-handle"; exit }
 $hwnd = $proc.MainWindowHandle
 Add-Type -TypeDefinition @'
 using System;
@@ -235,54 +241,165 @@ using System.Runtime.InteropServices;
 public class WinFocus {
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
+  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
+  [DllImport("user32.dll")] public static extern IntPtr SetActiveWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint p);
   [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool attach);
   [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+  [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr hAfter, int x, int y, int cx, int cy, uint flags);
+  [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
+  [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint msg, IntPtr wParam, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, uint msg, IntPtr wParam, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+  [DllImport("user32.dll")] public static extern void SwitchToThisWindow(IntPtr h, bool altTab);
 }
 '@ -ErrorAction SilentlyContinue
-[WinFocus]::ShowWindow($hwnd, 9)
+$isIconic = [WinFocus]::IsIconic($hwnd)
+$isVisible = [WinFocus]::IsWindowVisible($hwnd)
+Write-Output "state:iconic=$isIconic;visible=$isVisible"
+# Step 1: Restore via all known methods
+[WinFocus]::ShowWindow($hwnd, 1) | Out-Null
+[WinFocus]::ShowWindow($hwnd, 9) | Out-Null
+[WinFocus]::SendMessage($hwnd, 0x0112, [IntPtr]0xF120, [IntPtr]::Zero) | Out-Null
+# Step 2: AppActivate by process ID - works for many apps SetForegroundWindow won't touch
+$shell = New-Object -ComObject WScript.Shell
+$shell.AppActivate(${termPid}) | Out-Null
+Start-Sleep -Milliseconds 400
+# Step 3: Win32 force-focus
 $fg = [WinFocus]::GetForegroundWindow()
 $fgTid = 0; [WinFocus]::GetWindowThreadProcessId($fg, [ref]$fgTid) | Out-Null
 $myTid = [WinFocus]::GetCurrentThreadId()
+[WinFocus]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
+[WinFocus]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
 [WinFocus]::AttachThreadInput($myTid, $fgTid, $true) | Out-Null
+[WinFocus]::BringWindowToTop($hwnd) | Out-Null
+[WinFocus]::SetWindowPos($hwnd, [IntPtr](-1), 0, 0, 0, 0, 0x43) | Out-Null
 [WinFocus]::SetForegroundWindow($hwnd) | Out-Null
+[WinFocus]::SetActiveWindow($hwnd) | Out-Null
 [WinFocus]::AttachThreadInput($myTid, $fgTid, $false) | Out-Null
+[WinFocus]::SetWindowPos($hwnd, [IntPtr](-2), 0, 0, 0, 0, 0x43) | Out-Null
 Write-Output "focused"
 `
   try {
     fs.writeFileSync(tmpScript, ps)
-    const out = execSync(
+    const lines = execSync(
       `powershell.exe -NonInteractive -ExecutionPolicy Bypass -File "${tmpScript}"`,
       { timeout: 8000, stdio: ['ignore', 'pipe', 'ignore'] }
-    ).toString().trim()
-    return out === 'focused'
+    ).toString().trim().split('\n').map(l => l.trim())
+    const stateLine = lines.find(l => l.startsWith('state:'))
+    const winState = stateLine
+      ? Object.fromEntries(stateLine.slice(6).split(';').map(p => p.split('=')))
+      : null
+    return { focused: lines.includes('focused'), winState }
   } catch (_) {
-    return false
+    return { focused: false, winState: null }
   } finally {
     try { fs.unlinkSync(tmpScript) } catch (_) {}
+  }
+}
+
+function isAlive(pid) {
+  if (!pid) return false
+  try { process.kill(pid, 0); return true }
+  catch { return false }
+}
+
+const FOCUS_TAB_PS1 = path.join(__dirname, 'focusTab.ps1')
+
+function tryTabSwitch(label) {
+  // Write label to a temp file so special characters (", `, spaces) can't break the command string
+  const tmpArgs = path.join(os.tmpdir(), `cs-tablabel-${process.pid}.txt`)
+  try {
+    fs.writeFileSync(tmpArgs, label, 'utf8')
+    execSync(
+      `powershell.exe -NonInteractive -ExecutionPolicy Bypass -File "${FOCUS_TAB_PS1}" -Label (Get-Content -LiteralPath "${tmpArgs}" -Raw).Trim()`,
+      { timeout: 6000, stdio: ['ignore', 'pipe', 'ignore'] }
+    )
+    return 0
+  } catch (err) {
+    return (err && err.status != null) ? err.status : -1
+  } finally {
+    try { fs.unlinkSync(tmpArgs) } catch (_) {}
+  }
+}
+
+function openNewTab(cwd, label, sessionId) {
+  const resumeCmd = sessionId ? `claude --resume ${sessionId}` : `claude`
+  // Use spawn args array — Node handles Windows path encoding; no manual quoting needed
+  const args = [
+    '-w', '0',
+    'new-tab',
+    '--title', `[${label}]`,
+    '--startingDirectory', cwd || process.env.USERPROFILE || 'C:\\',
+    // Note: if cwd is absent, WT falls back to %USERPROFILE% — acceptable degraded case
+    'cmd', '/k', resumeCmd,
+  ]
+  try {
+    spawn('wt.exe', args, { detached: true, stdio: 'ignore' }).unref()
+    return true
+  } catch {
+    return false
   }
 }
 
 app.post('/api/sessions/:fileKey/focus', (req, res) => {
   const { fileKey } = req.params
   let focused = false
+  let opened  = false
+  const dbg   = {}
+
   try {
-    const session = JSON.parse(fs.readFileSync(path.join(sessionsDir, fileKey + '.json'), 'utf8'))
-    const { pid, terminalPid, sessionId } = session
-    const settings = (readMeta(metaFile)._settings) || {}
+    const sessionFile = path.join(sessionsDir, fileKey + '.json')
+    const session = JSON.parse(fs.readFileSync(sessionFile, 'utf8'))
+    const { pid, sessionId, cwd } = session
 
-    // Use pre-recorded terminal PID if available
-    let targetPid = terminalPid || null
+    const m     = readMeta(metaFile)
+    const entry = m[cwd] || {}
+    const label = entry.label || session.project || fileKey
 
-    if (!targetPid) {
-      const claudePid = findClaudePid(sessionId, pid)
-      if (claudePid) targetPid = walkToTerminal(claudePid, settings.preferredTerminal)
+    dbg.pid = pid; dbg.sessionId = sessionId; dbg.label = label
+
+    const alive = isAlive(pid)
+    dbg.alive = alive
+
+    if (alive) {
+      const exitCode = tryTabSwitch(label)
+      dbg.tabSwitchExit = exitCode
+
+      if (exitCode === 0) {
+        focused = true
+      } else {
+        // exit 1 (no WT) or exit 2 (tab not found):
+        // Fall back to existing window-level focus — supports non-WT terminals too.
+        // On exit 2, re-check liveness first; if now dead, open new tab instead.
+        const stillAlive = exitCode === 1 ? true : isAlive(pid)
+        if (stillAlive) {
+          const claudePid = findClaudePid(sessionId, pid)
+          const settings  = m._settings || {}
+          const termPid   = claudePid
+            ? walkToTerminal(claudePid, settings.preferredTerminal) || walkToTerminal(pid, settings.preferredTerminal)
+            : walkToTerminal(pid, settings.preferredTerminal)
+          if (termPid) focused = focusWindow(termPid).focused
+          dbg.fallbackTermPid = termPid
+        } else {
+          dbg.diedDuringSwitch = true
+          const resumeId = sessionId || entry.lastSessionId || null
+          opened = openNewTab(cwd, label, resumeId)
+        }
+      }
+    } else {
+      const resumeId = sessionId || entry.lastSessionId || null
+      dbg.resumeId = resumeId
+      opened = openNewTab(cwd, label, resumeId)
     }
+  } catch (err) {
+    dbg.error = err.message
+  }
 
-    if (targetPid) focused = focusWindow(targetPid)
-  } catch (_) {}
-  res.json({ focused })
+  console.log('[focus]', fileKey, dbg)
+  res.json({ focused, opened, dbg })
 })
 
 // ── Terminals + Settings ───────────────────────────────────────────────────────
