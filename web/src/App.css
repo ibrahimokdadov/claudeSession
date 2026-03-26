@@ -1,0 +1,91 @@
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg-primary:   #080c10;
+  --bg-secondary: #0d1117;
+  --bg-tertiary:  #161b22;
+  --bg-card:      #0d1117;
+  --bg-hover:     #161b22;
+  --border:       #21262d;
+  --border-dim:   #161b22;
+  --text-primary:   #e6edf3;
+  --text-secondary: #7d8590;
+  --text-dim:       #484f58;
+
+  --accent-waiting: #e3b341;
+  --accent-working: #58a6ff;
+  --accent-done:    #3fb950;
+  --accent-idle:    #484f58;
+
+  --font-mono: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', monospace;
+  --font-ui:   'IBM Plex Sans', -apple-system, sans-serif;
+
+  --radius-sm: 3px;
+  --radius-md: 6px;
+}
+
+html, body, #root {
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+button {
+  cursor: pointer;
+  border: none;
+  background: none;
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+}
+
+input {
+  font-family: var(--font-mono);
+  font-size: inherit;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-dim); }
+
+/* Status pulse animation */
+@keyframes pulse-ring {
+  0%   { box-shadow: 0 0 0 0 currentColor; opacity: 0.6; }
+  70%  { box-shadow: 0 0 0 5px currentColor; opacity: 0; }
+  100% { box-shadow: 0 0 0 0 currentColor; opacity: 0; }
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+@keyframes card-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes drawer-in {
+  from { transform: translateX(100%); opacity: 0; }
+  to   { transform: translateX(0); opacity: 1; }
+}
+
+.card-animate {
+  animation: card-in 0.15s ease-out both;
+}
+
+.drawer-animate {
+  animation: drawer-in 0.18s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
