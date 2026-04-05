@@ -1,0 +1,29 @@
+# claudeSession
+
+> Session identity and project awareness layer for Claude Code.
+
+claudeSession solves a common pain point for developers running multiple Claude Code sessions simultaneously: every tab shows the same title "Claude Code", making it impossible to tell which terminal belongs to which project.
+
+It hooks into Claude Code's hook system (SessionStart, PreToolUse, PostToolUse, Stop, Notification) to track every session's project, status, and last action. A lightweight web dashboard groups sessions by project, shows real-time status (working / waiting / done / crashed), and lets you focus or resume any session with one click.
+
+The tool also detects orphaned Claude processes, supports Windows Terminal tab switching via UI Automation, and displays subagent parent-child relationships as a tree.
+
+Built for developers who routinely have 10–20+ Claude Code sessions open across projects.
+
+## Key pages
+
+- /: Live session dashboard — all projects and sessions with real-time status
+
+## Tech stack
+
+- Backend: Node.js + Express + WebSocket (chokidar for file watching)
+- Frontend: React + Vite
+- Platform: Windows 11 + Windows Terminal (primary), with graceful fallback for other terminals
+
+## Contact
+
+ibrahim@whhite.com
+
+## Source
+
+https://github.com/ibrahimokdadov/claudesession
