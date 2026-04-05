@@ -805,8 +805,10 @@
         <div class="hero-eyebrow">Claude Code · Developer tool</div>
         <h1><span class="accent">claude</span>Session</h1>
         <p class="hero-desc">
-          Know which Claude Code session belongs to which project — at a glance.
-          Real-time status, one-click focus, subagent trees, and orphan detection.
+          You have 12 sessions open. You click into one, answer its question, approve the plan, say proceed. Three minutes later you realize it was the wrong session — and it just rewrote the wrong service.
+        </p>
+        <p class="hero-desc" style="margin-top:-16px">
+          claudeSession gives every session a name, a project, and a live status. You always know which one you're talking to.
         </p>
         <div class="btn-group">
           <a class="btn btn-primary" href="https://github.com/ibrahimokdadov/claudeSession" target="_blank" rel="noopener">
@@ -916,7 +918,7 @@
   <div class="container">
     <div class="section-label">The problem</div>
     <h2>Every tab says "Claude Code"</h2>
-    <p class="section-sub">With 10–20 sessions open across projects, you're flying blind. Which terminal is which project? What's it doing right now?</p>
+    <p class="section-sub">With 10–20 sessions open, there's no session registry, no process naming, no status indicator. The hooks exist in Claude Code but they feed nothing by default. So you click around, run <code style="font-family:var(--mono);font-size:13px;color:var(--blue)">pwd</code>, scroll back to find the first message — and still end up answering the wrong session.</p>
 
     <div class="problem-grid">
       <div>
@@ -933,7 +935,34 @@
       </div>
 
       <div class="problem-points">
-        <div style="font-family:var(--mono);font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:0.1em;margin-bottom:10px;">After</div>
+        <div style="font-family:var(--mono);font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:0.1em;margin-bottom:10px;">What actually goes wrong</div>
+        <div class="problem-point">
+          <div class="pp-icon" style="font-size:13px">⚠</div>
+          <div class="pp-text">
+            <strong>You answer the wrong session</strong>
+            <span>Detailed feedback, approved approach, "proceed" — on the payment service you weren't touching</span>
+          </div>
+        </div>
+        <div class="problem-point">
+          <div class="pp-icon" style="font-size:13px">👻</div>
+          <div class="pp-text">
+            <strong>Zombies stay "working" forever</strong>
+            <span>Sessions that crashed without a Stop hook look alive. You wait. Nothing comes.</span>
+          </div>
+        </div>
+        <div class="problem-point">
+          <div class="pp-icon" style="font-size:13px">🌀</div>
+          <div class="pp-text">
+            <strong>Subagents disappear into the void</strong>
+            <span>Claude spawns three parallel agents. You have no idea which terminal is which, or if they're still running</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div style="margin-top:40px;padding:20px 24px;background:var(--bg2);border:1px solid var(--border);border-radius:8px;border-left:3px solid var(--blue)">
+      <div style="font-family:var(--mono);font-size:11px;color:var(--blue);text-transform:uppercase;letter-spacing:0.1em;margin-bottom:8px;">After claudeSession</div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;">
         <div class="problem-point">
           <div class="pp-icon">🟢</div>
           <div class="pp-text">
@@ -967,12 +996,39 @@
   </div>
 </section>
 
-<!-- Features -->
-<section class="features">
+<div class="glow-line"></div>
+
+<!-- Differentiation strip -->
+<section style="padding:60px 0;border-top:none">
+  <div class="container">
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:24px;" class="diff-grid">
+      <div style="padding:20px;background:var(--bg2);border:1px solid var(--border);border-radius:8px;">
+        <div style="font-family:var(--mono);font-size:11px;color:var(--blue);margin-bottom:10px;">Hook-native, not polling</div>
+        <div style="font-size:13px;color:var(--text2);line-height:1.6">Status changes appear in milliseconds — claudeSession sits inside Claude's own hook pipeline. No file watching, no polling loop, no lag.</div>
+      </div>
+      <div style="padding:20px;background:var(--bg2);border:1px solid var(--border);border-radius:8px;">
+        <div style="font-family:var(--mono);font-size:11px;color:var(--green);margin-bottom:10px;">Identity, not metrics</div>
+        <div style="font-size:13px;color:var(--text2);line-height:1.6">Most Claude tools track tokens and cost. claudeSession tracks which session is which, who spawned whom, and which ones crashed without telling you.</div>
+      </div>
+      <div style="padding:20px;background:var(--bg2);border:1px solid var(--border);border-radius:8px;">
+        <div style="font-family:var(--mono);font-size:11px;color:var(--yellow);margin-bottom:10px;">Focus actually focuses</div>
+        <div style="font-size:13px;color:var(--text2);line-height:1.6">Clicking "Focus" calls a PowerShell UI Automation script that switches the Windows Terminal tab. Not just "here's the PID" — it moves focus to the right terminal.</div>
+      </div>
+    </div>
+  </div>
+</section>
+<style>
+  @media (max-width: 700px) { .diff-grid { grid-template-columns: 1fr !important; } }
+</style>
+
+<div class="glow-line"></div>
+
+<!-- Features (restored without old problem-points tail) -->
+<section class="features" style="border-top:none">
   <div class="container">
     <div class="features-header">
       <div class="section-label">Features</div>
-      <h2>Everything you need<br/>to tame the chaos</h2>
+      <h2>No patches. No internals.<br/>Just hooks and a dashboard.</h2>
     </div>
     <div class="features-grid">
       <div class="feat-card">
