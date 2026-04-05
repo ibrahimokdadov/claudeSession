@@ -5,7 +5,7 @@ import Settings from './Settings.jsx'
 import { groupIntoProjects } from './utils.js'
 import './App.css'
 
-const WS_URL = `ws://${location.host}/ws`
+const WS_URL = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`
 
 export default function App() {
   const [sessions, setSessions]         = useState(new Map())
