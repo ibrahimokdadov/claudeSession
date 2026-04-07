@@ -42,8 +42,8 @@ for (const file of fs.readdirSync(sessionsDir)) {
 writeMeta(metaFile, meta)
 loadAll(meta)
 
-// Process discovery: find running Claude sessions not yet in sessions dir
-try {
+// Process discovery: find running Claude sessions not yet in sessions dir (Windows only)
+if (!IS_MAC) try {
   const raw = execSync(
     'powershell.exe -NonInteractive -Command "Get-WmiObject Win32_Process | Where-Object { $_.CommandLine -like \'*claude-code/cli.js*\' } | Select-Object ProcessId,CommandLine,ParentProcessId | ConvertTo-Json -Compress"',
     { timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }
@@ -159,8 +159,98 @@ app.delete('/api/sessions/:fileKey', (req, res) => {
   res.json({ ok: true })
 })
 
+const IS_MAC = process.platform === 'darwin'
+
 // Known terminal process names (no .exe suffix)
 const TERMINAL_NAMES = ['WindowsTerminal', 'ConEmu64', 'ConEmu', 'Code', 'mintty', 'Hyper', 'Warp']
+
+// macOS terminal bundle IDs for process-tree matching
+const MAC_TERMINALS = {
+  'Terminal':        'com.apple.Terminal',
+  'iTerm2':          'com.googlecode.iterm2',
+  'Warp':            'dev.warp.Warp-Stable',
+  'kitty':           'net.kovidgoyal.kitty',
+  'Alacritty':       'org.alacritty',
+  'WezTerm':         'org.wezfurlong.wezterm',
+  'Hyper':           'co.zeit.hyper',
+  'Code':            'com.microsoft.VSCode',
+  'Cursor':          'com.todesktop.230313mzl4w4u92',
+}
+
+// ── macOS focus helpers ──────────────────────────────────────────────────────
+
+function macFindTerminalApp(pid) {
+  // Walk up the process tree via ps to find a known terminal
+  let current = pid
+  for (let i = 0; i < 15; i++) {
+    try {
+      const line = execSync(`ps -p ${current} -o ppid=,comm=`, {
+        timeout: 2000, stdio: ['ignore', 'pipe', 'ignore']
+      }).toString().trim()
+      if (!line) return null
+      const parts = line.match(/^\s*(\d+)\s+(.+)$/)
+      if (!parts) return null
+      const ppid = parseInt(parts[1], 10)
+      const comm = path.basename(parts[2])
+      for (const [name, bundleId] of Object.entries(MAC_TERMINALS)) {
+        if (comm.toLowerCase().includes(name.toLowerCase())) {
+          return { name, bundleId, pid: current }
+        }
+      }
+      if (ppid <= 1) return null
+      current = ppid
+    } catch (_) { return null }
+  }
+  return null
+}
+
+function macFocusApp(bundleId) {
+  try {
+    execSync(`osascript -e 'tell application id "${bundleId}" to activate'`, {
+      timeout: 3000, stdio: ['ignore', 'pipe', 'ignore']
+    })
+    return true
+  } catch (_) { return false }
+}
+
+function macOpenNewTab(cwd, sessionId) {
+  const cmd = sessionId ? `claude --resume ${sessionId}` : 'claude'
+  // Try the default terminal via `open -a Terminal`
+  try {
+    execSync(`osascript -e '
+      tell application "Terminal"
+        activate
+        do script "cd ${cwd.replace(/'/g, "'\\''")} && ${cmd}"
+      end tell
+    '`, { timeout: 4000, stdio: 'ignore' })
+    return true
+  } catch (_) { return false }
+}
+
+function macHandleFocus(session, meta, dbg) {
+  const { pid, sessionId, cwd } = session
+  const entry = meta[cwd] || {}
+  let focused = false, opened = false
+
+  const alive = isAlive(pid)
+  dbg.alive = alive
+
+  if (alive) {
+    const terminal = macFindTerminalApp(pid)
+    dbg.terminal = terminal ? terminal.name : null
+    if (terminal) {
+      focused = macFocusApp(terminal.bundleId)
+    }
+  }
+
+  if (!focused && !alive) {
+    const resumeId = sessionId || entry.lastSessionId || null
+    dbg.resumeId = resumeId
+    opened = macOpenNewTab(cwd, resumeId)
+  }
+
+  return { focused, opened }
+}
 
 function findClaudePid(sessionId, fallbackPid) {
   // 1. Check numeric PID files in sessions dir (written by claudeMonitor or similar)
@@ -361,38 +451,42 @@ app.post('/api/sessions/:fileKey/focus', (req, res) => {
 
     dbg.pid = pid; dbg.sessionId = sessionId; dbg.label = label
 
-    const alive = isAlive(pid)
-    dbg.alive = alive
-
-    if (alive) {
-      const exitCode = tryTabSwitch(label)
-      dbg.tabSwitchExit = exitCode
-
-      if (exitCode === 0) {
-        focused = true
-      } else {
-        // exit 1 (no WT) or exit 2 (tab not found):
-        // Fall back to existing window-level focus — supports non-WT terminals too.
-        // On exit 2, re-check liveness first; if now dead, open new tab instead.
-        const stillAlive = exitCode === 1 ? true : isAlive(pid)
-        if (stillAlive) {
-          const claudePid = findClaudePid(sessionId, pid)
-          const settings  = m._settings || {}
-          const termPid   = claudePid
-            ? walkToTerminal(claudePid, settings.preferredTerminal) || walkToTerminal(pid, settings.preferredTerminal)
-            : walkToTerminal(pid, settings.preferredTerminal)
-          if (termPid) focused = focusWindow(termPid).focused
-          dbg.fallbackTermPid = termPid
-        } else {
-          dbg.diedDuringSwitch = true
-          const resumeId = sessionId || entry.lastSessionId || null
-          opened = openNewTab(cwd, label, resumeId)
-        }
-      }
+    if (IS_MAC) {
+      const result = macHandleFocus(session, m, dbg)
+      focused = result.focused
+      opened = result.opened
     } else {
-      const resumeId = sessionId || entry.lastSessionId || null
-      dbg.resumeId = resumeId
-      opened = openNewTab(cwd, label, resumeId)
+      // Windows focus logic
+      const alive = isAlive(pid)
+      dbg.alive = alive
+
+      if (alive) {
+        const exitCode = tryTabSwitch(label)
+        dbg.tabSwitchExit = exitCode
+
+        if (exitCode === 0) {
+          focused = true
+        } else {
+          const stillAlive = exitCode === 1 ? true : isAlive(pid)
+          if (stillAlive) {
+            const claudePid = findClaudePid(sessionId, pid)
+            const settings  = m._settings || {}
+            const termPid   = claudePid
+              ? walkToTerminal(claudePid, settings.preferredTerminal) || walkToTerminal(pid, settings.preferredTerminal)
+              : walkToTerminal(pid, settings.preferredTerminal)
+            if (termPid) focused = focusWindow(termPid).focused
+            dbg.fallbackTermPid = termPid
+          } else {
+            dbg.diedDuringSwitch = true
+            const resumeId = sessionId || entry.lastSessionId || null
+            opened = openNewTab(cwd, label, resumeId)
+          }
+        }
+      } else {
+        const resumeId = sessionId || entry.lastSessionId || null
+        dbg.resumeId = resumeId
+        opened = openNewTab(cwd, label, resumeId)
+      }
     }
   } catch (err) {
     dbg.error = err.message
@@ -414,22 +508,47 @@ const KNOWN_TERMINALS = [
   { name: 'Hyper',           label: 'Hyper' },
 ]
 
+const MAC_KNOWN_TERMINALS = [
+  { name: 'Terminal',   label: 'Terminal.app' },
+  { name: 'iTerm2',     label: 'iTerm2' },
+  { name: 'Warp',       label: 'Warp' },
+  { name: 'kitty',      label: 'kitty' },
+  { name: 'Alacritty',  label: 'Alacritty' },
+  { name: 'WezTerm',    label: 'WezTerm' },
+  { name: 'Code',       label: 'VS Code (integrated terminal)' },
+  { name: 'Cursor',     label: 'Cursor' },
+  { name: 'Hyper',      label: 'Hyper' },
+]
+
 app.get('/api/terminals', (req, res) => {
   let running = []
-  try {
-    const nameList = KNOWN_TERMINALS.map(t => `'${t.name}'`).join(',')
-    const script = `Get-Process | Where-Object { ($_.Name -replace '\\.exe$','') -in @(${nameList}) } | Select-Object -ExpandProperty Name -Unique | ForEach-Object { $_ -replace '\\.exe$','' } | ConvertTo-Json -Compress`
-    const raw = execSync(`powershell.exe -NonInteractive -Command "${script}"`,
-      { timeout: 4000, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim()
-    if (raw) {
-      const names = JSON.parse(raw)
-      running = Array.isArray(names) ? names : [names]
-    }
-  } catch (_) {}
+  const termList = IS_MAC ? MAC_KNOWN_TERMINALS : KNOWN_TERMINALS
+
+  if (IS_MAC) {
+    try {
+      const raw = execSync('ps -eo comm=', {
+        timeout: 3000, stdio: ['ignore', 'pipe', 'ignore']
+      }).toString()
+      for (const t of termList) {
+        if (raw.toLowerCase().includes(t.name.toLowerCase())) running.push(t.name)
+      }
+    } catch (_) {}
+  } else {
+    try {
+      const nameList = termList.map(t => `'${t.name}'`).join(',')
+      const script = `Get-Process | Where-Object { ($_.Name -replace '\\.exe$','') -in @(${nameList}) } | Select-Object -ExpandProperty Name -Unique | ForEach-Object { $_ -replace '\\.exe$','' } | ConvertTo-Json -Compress`
+      const raw = execSync(`powershell.exe -NonInteractive -Command "${script}"`,
+        { timeout: 4000, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim()
+      if (raw) {
+        const names = JSON.parse(raw)
+        running = Array.isArray(names) ? names : [names]
+      }
+    } catch (_) {}
+  }
 
   const settings = (readMeta(metaFile)._settings) || {}
   res.json({
-    terminals: KNOWN_TERMINALS.map(t => ({
+    terminals: termList.map(t => ({
       ...t,
       running: running.includes(t.name),
     })),
