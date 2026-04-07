@@ -12,7 +12,8 @@ if (!fs.existsSync(dist)) {
   console.log('Installing dependencies...')
   execSync('npm install --production=false', { cwd: root, stdio: 'inherit' })
   console.log('Building frontend...')
-  execSync('node node_modules/.bin/vite build web/', { cwd: root, stdio: 'inherit' })
+  const vite = require.resolve('vite/bin/vite.js', { paths: [root] })
+  execSync(`node "${vite}" build web/`, { cwd: root, stdio: 'inherit' })
 }
 
 // Start the server
