@@ -9,6 +9,7 @@ const { execSync, spawn } = require('child_process')
 const { readMeta, writeMeta, ensureProject } = require('./meta.js')
 const { loadAll, updateFromFile, removeByFile, getAll, getByFileKey, store, sessionsDir, metaFile } = require('./sessions.js')
 
+const IS_MAC = process.platform === 'darwin'
 const PORT = process.env.PORT || 3333
 const app  = express()
 app.use(express.json())
@@ -158,8 +159,6 @@ app.delete('/api/sessions/:fileKey', (req, res) => {
   broadcast({ type: 'session_removed', fileKey })
   res.json({ ok: true })
 })
-
-const IS_MAC = process.platform === 'darwin'
 
 // Known terminal process names (no .exe suffix)
 const TERMINAL_NAMES = ['WindowsTerminal', 'ConEmu64', 'ConEmu', 'Code', 'mintty', 'Hyper', 'Warp']
