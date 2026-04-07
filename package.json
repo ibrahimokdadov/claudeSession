@@ -1,7 +1,16 @@
 {
-  "name": "claudesession",
+  "name": "claude-session",
   "version": "1.0.0",
   "type": "commonjs",
+  "bin": {
+    "claude-session": "bin/claude-session.js"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "web/",
+    "session-hook.js"
+  ],
   "scripts": {
     "dev": "concurrently \"node src/server.js\" \"vite web/\"",
     "build": "vite build web/",
