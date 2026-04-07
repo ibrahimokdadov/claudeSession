@@ -7,10 +7,12 @@ const fs = require('fs')
 const root = path.join(__dirname, '..')
 const dist = path.join(root, 'web', 'dist')
 
-// Build frontend if not already built
+// Install deps + build frontend if not already built
 if (!fs.existsSync(dist)) {
+  console.log('Installing dependencies...')
+  execSync('npm install --production=false', { cwd: root, stdio: 'inherit' })
   console.log('Building frontend...')
-  execSync('npx vite build web/', { cwd: root, stdio: 'inherit' })
+  execSync('node node_modules/.bin/vite build web/', { cwd: root, stdio: 'inherit' })
 }
 
 // Start the server
