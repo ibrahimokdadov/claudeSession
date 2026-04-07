@@ -38,7 +38,7 @@ jobs:
           fi
 
       - name: Run implement agent
-        uses: "anthropics/claude-code-action@REPLACE_WITH_SHA"
+        uses: "anthropics/claude-code-action@6cad158a175744eb2e76f7f5fd108ec63145598c"
         with:
           prompt: |
             # Implementation Agent — System Prompt
